@@ -21,13 +21,14 @@
 
 
 import os
+import copy
 import yaml
 import json
 import re
-from typing import Dict, Any, Optional, Callable, List
+from typing import Dict, Any, Optional, Callable, List, Set
 import asyncio
 from datetime import datetime
-from .... import aiotools
+from .... import aiotools, usb
 from ....tools import run_command, run_shell
 
 from aiohttp.web import Request, Response
@@ -49,6 +50,7 @@ from .config_utils import (
     get_nested_value as _get_nested_value_util,
     set_nested_value as _set_nested_value_util,
 )
+from ..hid_otg_lifecycle import resume_hid_otg, suspend_hid_otg
 
 
 from ....logging import get_logger
@@ -83,6 +85,8 @@ class SystemApi:
         self._capability_path = "/proc/gl-hw-info/capability"
 
         self.__otg_lock = asyncio.Lock()
+        self.__otg_applying = False
+        self.__otg_apply_error = None
 
         # 服务启动时强制重置隐私状态，确保开机默认关闭
         ##self._reset_privacy_state_on_startup()
@@ -108,6 +112,15 @@ class SystemApi:
         """将整数转换为0x前缀的16进制字符串"""
         return f"0x{value:04X}"
 
+    def __valid_camera_name(self, value: Optional[str]) -> str:
+        """验证并规范化摄像头名称"""
+        if value is None:
+            raise BadRequestError("Missing camera name")
+        value = value.strip()
+        if not value:
+            raise BadRequestError("camera_name parameter cannot be empty")
+        return value
+
     def _read_usb_pid(self) -> int:
         """从 /proc/gl-hw-info/usb_pid 读取 USB Product ID"""
         try:
@@ -120,6 +133,32 @@ class SystemApi:
             self._logger.warning(f"Failed to read USB PID from {self._usb_pid_path}: {e}")
         # 如果读取失败，返回默认值 260 (0x0104)
         return 260
+
+    def _read_cpu_model(self) -> str:
+        # 优先从 device-tree 读取 SoC 型号(最准确,如 rv1126/rv1126b/ax620e)
+        try:
+            with open("/proc/device-tree/compatible", "rb") as f:
+                comps = [c for c in f.read().decode(errors="ignore").split("\0") if c]
+            # compatible 列表从具体(board)排到通用(soc),取最后一个 "vendor,soc"
+            for comp in reversed(comps):
+                if "," in comp:
+                    return comp.split(",", 1)[1].strip()  # rockchip,rv1126 -> rv1126
+        except Exception as e:
+            self._logger.warning(f"Failed to read SoC model from device-tree: {e}")
+
+        # 回退:/proc/cpuinfo(型号较泛)
+        try:
+            with open("/proc/cpuinfo", "r") as f:
+                cpuinfo = f.read()
+
+            for key in ("Hardware", "model name", "Processor"):
+                match = re.search(rf"^{key}\s*:\s*(.+)$", cpuinfo, re.MULTILINE)
+                if match:
+                    return match.group(1).strip()
+        except Exception as e:
+            self._logger.warning(f"Failed to read CPU model: {e}")
+
+        return "unknown"
 
     @exposed_http("GET", "/system/clients", allowed_exe_paths=["/usr/sbin/gl_kvm_gui"])
     async def get_clients_handler(self, request: Request) -> Response:
@@ -137,6 +176,10 @@ class SystemApi:
             streaming_count = 0
             
             for ws in wss:
+                # 跳过服务类连接（如 gl-pion 经 /hid/ws 中继的 HID 通道），
+                # 它们不是真实终端用户，不应计入客户端列表与统计。
+                if ws.kwargs.get("device_type") == "service":
+                    continue
                 # 从会话 kwargs 中获取客户端 IP（在 WebSocket 连接时保存）
                 remote = ws.kwargs.get("client_ip", "unknown")
                 # 获取客户端浏览器信息
@@ -162,7 +205,7 @@ class SystemApi:
             
             return make_json_response({
                 "success": True,
-                "total_connections": len(wss),
+                "total_connections": len(clients),
                 "unique_ips": len(unique_ips),
                 "streaming_count": streaming_count,
                 "clients": clients
@@ -186,6 +229,8 @@ class SystemApi:
                                 capabilities[filename] = f.read().strip()
                         except Exception as e:
                             self._logger.warning(f"Failed to read capability file {filename}: {e}")
+
+            capabilities["cpu_model"] = self._read_cpu_model()
 
             return make_json_response({
                 "success": True,
@@ -235,27 +280,40 @@ class SystemApi:
                     "error": f"Client with id {client_id} not found"
                 }, status=404)
             
-            # 获取 auth_token 并登出
+            # 获取 auth_token，反查所有使用同一 token 的 session
             auth_token = target_ws.kwargs.get("auth_token", "")
+            wss_to_close = []
+            if auth_token:
+                for ws in wss:
+                    if ws.kwargs.get("auth_token", "") == auth_token:
+                        wss_to_close.append(ws)
+            if not wss_to_close:
+                wss_to_close = [target_ws]
+
+            # 登出 token（只删一次）
             if auth_token and self._logout:
                 try:
                     self._logout(auth_token)
                     self._logger.info(f"Logged out token for client {client_id}")
                 except Exception as e:
                     self._logger.warning(f"Failed to logout token for client {client_id}: {e}")
-            
-            # 关闭 WebSocket 连接之前，先通知客户端被踢出
-            try:
-                await target_ws.send_event("kickout", {
-                    "reason": "deleted_by_admin",
-                })
-            except Exception:
-                pass
 
-            # 关闭 WebSocket 连接
-            await self._close_ws(target_ws)
-            self._logger.info(f"Disconnected client {client_id}")
-            
+            # 通知并关闭所有使用该 token 的 session
+            disconnected_ids = []
+            for ws in wss_to_close:
+                try:
+                    await ws.send_event("kickout", {
+                        "reason": "deleted_by_admin",
+                    })
+                except Exception:
+                    pass
+                try:
+                    disconnected_ids.append(id(ws))
+                    await self._close_ws(ws)
+                    self._logger.info(f"Disconnected client {id(ws)}")
+                except Exception as e:
+                    self._logger.warning(f"Failed to close client {id(ws)}: {e}")
+
             # 重启相关进程
             restart_scripts = [
                 "killall janus",
@@ -273,10 +331,11 @@ class SystemApi:
                     self._logger.warning(f"Script {script} timed out")
                 except Exception as e:
                     self._logger.warning(f"Failed to execute {script}: {e}")
-            
+
             return make_json_response({
                 "success": True,
-                "disconnected_id": client_id,
+                "disconnected_ids": disconnected_ids,
+                "disconnected_count": len(disconnected_ids),
                 "token_deleted": bool(auth_token and self._logout)
             })
             
@@ -285,32 +344,44 @@ class SystemApi:
             return make_json_exception(BadRequestError(f"Error disconnecting client: {str(e)}"), 502)
 
     async def _get_ethernet_service_id(self) -> Optional[str]:
-        """获取以太网服务ID"""
+        """获取 eth0 对应的以太网服务ID"""
         try:
-            # 执行命令获取以太网服务ID
             returncode, stdout_text, stderr_text = await run_command(
                 "connmanctl", "services", timeout=10
             )
-            
+
             if returncode != 0:
                 self._logger.error(f"connmanctl services command failed: {stderr_text}")
                 return None
-                
-            # 解析输出，查找ethernet服务
+
+            service_ids = []
             for line in stdout_text.split('\n'):
-                if 'ethernet' in line.lower():
-                    # 提取服务ID（第三列）
-                    parts = line.split()
-                    if len(parts) >= 3:
-                        return parts[2]
-            
+                parts = line.split()
+                for part in reversed(parts):
+                    if part.startswith("ethernet_"):
+                        service_ids.append(part)
+                        break
+
+            for service_id in service_ids:
+                returncode, service_text, stderr_text = await run_command(
+                    "connmanctl", "services", service_id, timeout=10
+                )
+
+                if returncode != 0:
+                    self._logger.warning(f"connmanctl services {service_id} command failed: {stderr_text}")
+                    continue
+
+                config = await self._parse_connman_output(service_text)
+                if config.get("interface") == "eth0":
+                    return service_id
+
             return None
-            
+
         except asyncio.TimeoutError:
             self._logger.error("connmanctl services command timeout")
             return None
         except Exception as e:
-            self._logger.error(f"Error getting ethernet service ID: {e}")
+            self._logger.error(f"Error getting eth0 ethernet service ID: {e}")
             return None
 
     async def _parse_connman_output(self, output: str) -> Dict[str, Any]:
@@ -735,6 +806,7 @@ class SystemApi:
                 "cdrom_vendor": self._get_nested_value(data, "otg/devices/msd/default/inquiry_string/cdrom/vendor", "Glinet"),
                 "flash_vendor": self._get_nested_value(data, "otg/devices/msd/default/inquiry_string/flash/vendor", "Glinet"),
                 "mic_name": self._get_nested_value(data, "otg/devices/audio/product", "Comet Microphone"),
+                "camera_name": self._get_nested_value(data, "otg/devices/camera/product", "UVC Camera"),
                 "default_product_id": self._int_to_hex_str(usb_pid_from_proc),
                 "default_vendor_id": self._int_to_hex_str(14571),
 
@@ -770,7 +842,8 @@ class SystemApi:
             cdrom_vendor = request.query.get("cdrom_vendor")
             flash_vendor = request.query.get("flash_vendor")
             mic_name = request.query.get("mic_name")
-            
+            camera_name = request.query.get("camera_name")
+
             privacy_enable = request.query.get("privacy_enable")
             privacy_restore = request.query.get("privacy_restore")
 
@@ -825,6 +898,11 @@ class SystemApi:
                     raise BadRequestError("mic_name parameter cannot be empty")
                 self._set_nested_value(data, "otg/devices/audio/product", mic_name)
 
+            if camera_name is not None:
+                camera_name = self.__valid_camera_name(camera_name)
+                self._set_nested_value(data, "otg/devices/camera/product", camera_name)
+                otg_changed = True
+
             # 写入配置
             await self._write_yaml(data)
 
@@ -860,6 +938,7 @@ class SystemApi:
                 "cdrom_vendor": self._get_nested_value(data, "otg/devices/msd/default/inquiry_string/cdrom/vendor", "Glinet"),
                 "flash_vendor": self._get_nested_value(data, "otg/devices/msd/default/inquiry_string/flash/vendor", "Glinet"),
                 "mic_name": self._get_nested_value(data, "otg/devices/audio/product", "Comet Microphone"),
+                "camera_name": self._get_nested_value(data, "otg/devices/camera/product", "UVC Camera"),
                 "privacy_enable": privacy_state["privacy_enable"],
                 "privacy_restore": privacy_state["privacy_restore"],
             })
@@ -884,18 +963,32 @@ class SystemApi:
         "enable_mouse_alt":("otg/devices/hid/mouse_alt/start",True,  "hid.usb2"),
         "start_cdrom":     ("otg/devices/msd/start_cdrom",    False, "mass_storage.0"),
         "start_flash":     ("otg/devices/msd/start_flash",    False, "mass_storage.1"),
-        "enable_mic":      ("otg/devices/audio/start",        False, "uac1.usb0" if model_name == "rmq1" else "uac2.usb0"),
+        "enable_mic":      ("otg/devices/audio/start",        False, "uac2.usb0"),
+        "enable_camera":   ("otg/devices/camera/start",       False,  "uvc.gs6"),
+        "enable_mtp":      ("otg/devices/mtp/start",          False,  "ffs.mtp"),
     }
 
     @exposed_http("GET", "/system/otg_functions")
     async def get_otg_functions_handler(self, request: Request) -> Response:
         """获取 OTG function（HID/MSD/麦克风）的启用状态"""
         try:
-            data = await self._read_yaml()
-            return make_json_response({
-                key: self._get_nested_value(data, yaml_path, default)
-                for key, (yaml_path, default, _) in self._OTG_FUNC_MAP.items()
+            wait_ready = valid_bool(request.query.get("wait_ready", "true"))
+            timeout = float(request.query.get("timeout", "10000")) / 1000
+
+            if wait_ready:
+                ready, current_funcs, sync_error = await self.__wait_otg_functions_synced(timeout)
+            else:
+                current_funcs = self.__get_current_otg_functions()
+                ready = not self.__otg_applying
+                sync_error = None
+
+            payload = self.__otg_functions_to_payload(current_funcs)
+            payload.update({
+                "applying": self.__otg_applying,
+                "ready": ready,
+                "apply_error": self.__otg_apply_error or sync_error,
             })
+            return make_json_response(payload)
         except BadRequestError as e:
             return make_json_exception(e, 400)
         except Exception as e:
@@ -908,6 +1001,7 @@ class SystemApi:
         try:
             async with self.__otg_lock:
                 data = await self._read_yaml()
+                old_data = copy.deepcopy(data)
                 funcs_to_enable: set[str] = set()
                 funcs_to_disable: set[str] = set()
 
@@ -919,23 +1013,94 @@ class SystemApi:
                     self._set_nested_value(data, yaml_path, val)
                     (funcs_to_enable if val else funcs_to_disable).add(func_name)
 
-                # rmq1: mic 开关联动 rndis（特殊 side-effect）
-                if model_name == "rmq1" and request.query.get("enable_mic") is not None:
-                    self._set_nested_value(
-                        data, "otg/devices/rndis/enabled",
-                        not self._get_nested_value(data, "otg/devices/audio/start", False),
-                    )
-
                 await self._write_yaml(data)
 
-                if funcs_to_enable or funcs_to_disable:
-                    self._logger.info("OTG functions changed, applying via kvmd-otgconf ...")
-                    await self.__change_otg_functions(funcs_to_enable, funcs_to_disable)
+                # 根据 gadget profile 的实际 symlink 状态判断是否真的改变了 function 集合
+                # 与 kvmd-otgconf.change_functions() 的判断逻辑完全对齐
+                gadget = self._get_nested_value(data, "otg/gadget", "rockchip")
+                profile_path = usb.get_gadget_path(gadget, usb.G_PROFILE)
+                currently_enabled: Set[str] = set()
+                if os.path.isdir(profile_path):
+                    currently_enabled = {
+                        func for func in os.listdir(profile_path)
+                        if os.path.islink(os.path.join(profile_path, func))
+                    }
+                target_enabled: Set[str] = (currently_enabled - funcs_to_disable) | funcs_to_enable
+                functions_changed = currently_enabled != target_enabled
 
-                return make_json_response({
+                camera_was_enabled = "uvc.gs6" in currently_enabled
+                camera_will_be_enabled = "uvc.gs6" in target_enabled
+                use_full_rebuild = functions_changed and (camera_was_enabled or camera_will_be_enabled)
+
+                camera_ready: bool | None = None
+                camera_error: str | None = None
+                hid_suspended = False
+
+                self.__otg_apply_error = None
+                if functions_changed:
+                    self.__otg_applying = True
+                    try:
+                        # touch cooldown 文件：kvmd-otgconf/kvmd-otg 会做 UDC rebind，rebind 完成后
+                        # extcon USB=1 约 4 秒后触发。此时操作进程已退出，pgrep 无法
+                        # 拦截。cooldown 文件在 reset_uvc_udc 中被检查，防止二次 rebind 循环。
+                        try:
+                            open("/var/run/reset_uvc_udc.cooldown", "w").close()
+                        except Exception:
+                            pass
+
+                        if use_full_rebuild:
+                            self._logger.info("Camera is enabled or will be enabled: rebuilding whole OTG gadget ...")
+                            await suspend_hid_otg(self._logger, "OTG full rebuild", timeout=3.0)
+                            hid_suspended = True
+                            self._logger.info("Stopping rkipc and watchdog before full OTG rebuild ...")
+                            await run_shell("/etc/init.d/S99rkipc full_stop", timeout=10)
+                            await self.__wait_rkipc_stopped(timeout=5.0)
+
+                            self._logger.info("OTG full rebuild: applying function links via kvmd-otgconf ...")
+                            await self.__change_otg_functions(funcs_to_enable, funcs_to_disable)
+
+                            if camera_will_be_enabled:
+                                self._logger.info("Camera enabled: starting rkipc and watchdog ...")
+                                # 加 >/dev/null 2>&1：S99rkipc full_start 会后台启动 rkipc|logger，
+                                # 两个子进程会继承 asyncio 的 stdout pipe；若不重定向，
+                                # communicate() 会等 pipe EOF（即等 rkipc/logger 退出），
+                                # 导致 15s 超时 → TimeoutError → HTTP 502。
+                                await run_shell("/etc/init.d/S99rkipc full_start >/dev/null 2>&1", timeout=10)
+                                camera_ready, camera_error = await self.__wait_camera_ready(timeout=15.0)
+                                if camera_ready:
+                                    self._logger.info("Camera enabled: rkipc and watchdog started, UDC configured")
+                                else:
+                                    self._logger.warning("Camera enabled but UDC is not configured yet: %s", camera_error)
+                        else:
+                            if "uvc.gs6" in funcs_to_disable:
+                                self._logger.info("Camera disabled: stopping rkipc ...")
+                                await run_shell("/etc/init.d/S99rkipc full_stop", timeout=10)
+
+                            self._logger.info("OTG functions changed, applying via kvmd-otgconf ...")
+                            await self.__change_otg_functions(funcs_to_enable, funcs_to_disable)
+                    except Exception as e:
+                        self.__otg_apply_error = str(e)
+                        try:
+                            await self._write_yaml(old_data)
+                        except Exception as rollback_error:
+                            self._logger.error(f"Failed to roll back OTG configuration: {rollback_error}")
+                        raise
+                    finally:
+                        try:
+                            if hid_suspended:
+                                resume_hid_otg(self._logger, "OTG full rebuild")
+                        finally:
+                            self.__otg_applying = False
+
+                response = {
                     key: self._get_nested_value(data, yaml_path, default)
                     for key, (yaml_path, default, _) in self._OTG_FUNC_MAP.items()
-                })
+                }
+                if camera_ready is not None:
+                    response["camera_ready"] = camera_ready
+                    if camera_error:
+                        response["camera_error"] = camera_error
+                return make_json_response(response)
 
         except BadRequestError as e:
             return make_json_exception(e, 400)
@@ -1369,12 +1534,14 @@ class SystemApi:
             with open(firewall_conf_path, "w") as f:
                 json.dump(config_json, f, indent=4, ensure_ascii=False)
 
-            await asyncio.create_subprocess_shell("sync")
+            await run_command("sync", timeout=30)
             # 任一开启则 restart，全关则 stop
             if enable or enable_v6:
-                await asyncio.create_subprocess_shell("/etc/init.d/S99firewall restart")
+                retcode, _, stderr = await run_command("/etc/init.d/S99firewall", "restart", timeout=60)
             else:
-                await asyncio.create_subprocess_shell("/etc/init.d/S99firewall stop")
+                retcode, _, stderr = await run_command("/etc/init.d/S99firewall", "stop", timeout=60)
+            if retcode != 0:
+                self._logger.warning("Firewall script failed with code %d: %s", retcode, stderr.strip())
 
             return make_json_response({
                 "success": True,
@@ -2098,6 +2265,136 @@ class SystemApi:
 
     # ===== OTG Restart
 
+    def __get_current_otg_functions(self) -> set[str]:
+        base_path = "/sys/kernel/config/usb_gadget"
+        for gadget in ("rockchip", "kvmd", "gadget.0"):
+            profile_path = os.path.join(base_path, gadget, usb.G_PROFILE)
+            try:
+                if not os.path.isdir(profile_path):
+                    continue
+                funcs = {
+                    func for func in os.listdir(profile_path)
+                    if os.path.islink(os.path.join(profile_path, func))
+                }
+                self._logger.info("Current OTG functions from %s: %s", profile_path, sorted(funcs))
+                return funcs
+            except Exception as e:
+                self._logger.warning(f"Failed to read OTG functions from {profile_path}: {e}")
+
+        raise BadRequestError("Failed to read current OTG functions")
+
+    def __get_managed_otg_functions(self) -> set[str]:
+        return {func_name for _, _, func_name in self._OTG_FUNC_MAP.values()}
+
+    def __otg_functions_to_payload(self, funcs: set[str]) -> dict:
+        return {
+            key: func_name in funcs
+            for key, (_, _, func_name) in self._OTG_FUNC_MAP.items()
+        }
+
+    async def __get_expected_otg_functions(self) -> set[str]:
+        data = await self._read_yaml()
+        return {
+            func_name
+            for _, (yaml_path, default, func_name) in self._OTG_FUNC_MAP.items()
+            if self._get_nested_value(data, yaml_path, default)
+        }
+
+    def __is_rkipc_running(self) -> bool:
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            try:
+                with open(os.path.join("/proc", name, "comm")) as file:
+                    if file.read().strip() == "rkipc":
+                        return True
+            except Exception:
+                pass
+        return False
+
+    async def __wait_rkipc_stopped(self, timeout: float) -> bool:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            if not self.__is_rkipc_running():
+                return True
+
+            if loop.time() >= deadline:
+                self._logger.warning("Timeout waiting for rkipc stopped")
+                return False
+
+            await asyncio.sleep(0.1)
+
+    def __get_otg_udc_state(self) -> str:
+        base_path = "/sys/kernel/config/usb_gadget"
+        for gadget in ("rockchip", "kvmd", "gadget.0"):
+            udc_path = os.path.join(base_path, gadget, usb.G_UDC)
+            try:
+                if not os.path.exists(udc_path):
+                    continue
+                with open(udc_path) as file:
+                    udc = file.read().strip()
+                if not udc:
+                    continue
+                state_path = usb.get_udc_path(udc, usb.U_STATE)
+                with open(state_path) as file:
+                    return file.read().strip()
+            except Exception as e:
+                self._logger.warning(f"Failed to read UDC state from {udc_path}: {e}")
+        return ""
+
+    async def __wait_otg_functions_synced(self, timeout: float) -> tuple[bool, set[str], str | None]:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        managed_funcs = self.__get_managed_otg_functions()
+        current_funcs: set[str] = set()
+        sync_error: str | None = None
+
+        while True:
+            try:
+                current_funcs = self.__get_current_otg_functions()
+                expected_funcs = await self.__get_expected_otg_functions()
+                current_managed = current_funcs & managed_funcs
+                expected_managed = expected_funcs & managed_funcs
+
+                if not self.__otg_applying and current_managed == expected_managed:
+                    return True, current_funcs, None
+
+                sync_error = (
+                    "OTG functions not synced: "
+                    f"applying={self.__otg_applying}, "
+                    f"current={sorted(current_managed)}, "
+                    f"expected={sorted(expected_managed)}"
+                )
+            except Exception as e:
+                sync_error = str(e)
+
+            if loop.time() >= deadline:
+                self._logger.warning("Timeout waiting for OTG functions synced: %s", sync_error)
+                return False, current_funcs, sync_error or "Timeout waiting for OTG functions synced"
+
+            await asyncio.sleep(0.1)
+
+    async def __wait_camera_ready(self, timeout: float) -> tuple[bool, str | None]:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        last_error: str | None = None
+
+        while True:
+            rkipc_running = self.__is_rkipc_running()
+            udc_state = self.__get_otg_udc_state()
+            if rkipc_running and udc_state == "configured":
+                return True, None
+
+            last_error = (
+                "Timeout waiting for camera configured: "
+                f"rkipc_running={rkipc_running}, udc_state={udc_state or 'unknown'}"
+            )
+            if loop.time() >= deadline:
+                return False, last_error
+
+            await asyncio.sleep(0.1)
+
     async def __restart_otg(self) -> None:
         """通过 kvmd-otg stop + start 子进程完整重建 OTG gadget"""
         self._logger.info("Restarting OTG gadget: stop + start ...")
@@ -2115,6 +2412,15 @@ class SystemApi:
             raise BadRequestError(f"kvmd-otg start failed: {stderr}")
 
         self._logger.info("OTG gadget restarted successfully")
+
+    async def __reset_otg_udc(self) -> None:
+        """通过 kvmd-otgconf reset-gadget 执行 DWC3 unbind/bind"""
+        self._logger.info("Resetting OTG UDC via kvmd-otgconf --reset-gadget ...")
+        returncode, _, stderr = await run_command("kvmd-otgconf", "--reset-gadget", timeout=30)
+        if returncode != 0:
+            self._logger.error("kvmd-otgconf --reset-gadget failed: %s", stderr)
+            raise BadRequestError(f"kvmd-otgconf --reset-gadget failed: {stderr}")
+        self._logger.info("OTG UDC reset successfully")
 
     async def __change_otg_functions(self, enable: set[str], disable: set[str]) -> None:
         """通过 kvmd-otgconf link/unlink 指定 function，无需重建整个 gadget"""

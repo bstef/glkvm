@@ -43,7 +43,7 @@ class InfoManager:
             "auth":   AuthInfoSubmanager(config.kvmd.auth.enabled),
             "meta":   MetaInfoSubmanager(config.kvmd.info.meta),
             "extras": ExtrasInfoSubmanager(config),
-            # "health": HealthInfoSubmanager(**config.kvmd.info.hw._unpack(ignore="platform")),
+            "health": HealthInfoSubmanager(**config.kvmd.info.hw._unpack(ignore="platform")),
             # "fan":    FanInfoSubmanager(**config.kvmd.info.fan._unpack()),
         }
         self.__queue: "asyncio.Queue[tuple[str, (dict | None)]]" = asyncio.Queue()

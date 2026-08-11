@@ -20,10 +20,7 @@
 # ========================================================================== #
 
 import asyncio
-import subprocess
 from typing import Dict, Optional
-import json
-import os
 
 from aiohttp.web import Request, Response
 
@@ -34,6 +31,7 @@ from ....htserver import (
     make_json_exception,
 )
 from ....logging import get_logger
+from .common import is_process_running, run_command, update_json_file, read_json_file
 
 logger = get_logger()
 
@@ -45,101 +43,22 @@ class CloudflareApi:
         self._logger = logger
 
     async def _run_command(self, cmd: str) -> str:
-        """
-        执行系统命令
-        """
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd.split(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            if process.returncode != 0:
-                self._logger.error(f"Command failed: {stderr.decode()}")
-                raise BadRequestError(f"Command failed: {stderr.decode()}")
-            return stdout.decode().strip()
-        except Exception as e:
-            self._logger.error(f"Error executing command: {e}")
-            raise BadRequestError(f"Error executing command: {e}")
+        return await run_command(cmd, logger=self._logger)
 
     async def _check_cloudflared_process(self) -> bool:
-        """
-        检查 cloudflared 进程是否存在
-        """
-        try:
-            process = await asyncio.create_subprocess_exec(
-                "pgrep", "-f", "cloudflared",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            return process.returncode == 0
-        except Exception as e:
-            self._logger.error(f"Error checking cloudflared process: {e}")
-            return False
+        return await is_process_running(["pgrep", "-f", "cloudflared"], logger=self._logger, error_label="cloudflared process")
 
     async def _read_config_file(self) -> Dict:
-        """
-        读取配置文件
-        """
-        config_path = self.__config_path
-        
-        try:
-            if os.path.exists(config_path):
-                with open(config_path, "r") as f:
-                    config = json.load(f)
-                return config
-            else:
-                # 如果配置文件不存在，返回默认配置
-                return {
-                    "enable": False,
-                    "token": ""
-                }
-        except Exception as e:
-            self._logger.error(f"Failed to read config file {config_path}: {e}")
-            return {
-                "enable": False,
-                "token": ""
-            }
+        return await read_json_file(self.__config_path, {"enable": False, "token": ""}, logger=self._logger)
 
     async def _update_config_file(self, enable: Optional[bool] = None, token: Optional[str] = None) -> None:
-        """
-        更新配置文件
-        
-        Args:
-            enable: True表示启用，False表示禁用，None表示不更改
-            token: 新的token值，None表示不更改
-        """
-        config_path = self.__config_path
-        config_dir = os.path.dirname(config_path)
-        
-        # 确保目录存在
-        try:
-            os.makedirs(config_dir, exist_ok=True)
-        except Exception as e:
-            self._logger.error(f"Failed to create config directory {config_dir}: {e}")
-            raise BadRequestError(f"Failed to create config directory: {e}")
-        
-        # 读取现有配置
-        config = await self._read_config_file()
-        
-        # 更新配置
-        if enable is not None:
-            config["enable"] = enable
-        if token is not None:
-            config["token"] = token
-        
-        # 写入配置文件
-        try:
-            with open(config_path, "w") as f:
-                json.dump(config, f, indent=4)
-            await asyncio.create_subprocess_shell("sync")
-                
-            self._logger.info(f"Updated Cloudflare config file: enable={config.get('enable')}, token_set={bool(config.get('token'))}")
-        except Exception as e:
-            self._logger.error(f"Failed to write config file {config_path}: {e}")
-            raise BadRequestError(f"Failed to write config file: {e}")
+        config = await update_json_file(
+            self.__config_path,
+            {"enable": False, "token": ""},
+            {"enable": enable, "token": token},
+            logger=self._logger,
+        )
+        self._logger.info(f"Updated Cloudflare config file: enable={config.get('enable')}, token_set={bool(config.get('token'))}")
 
     @exposed_http("GET", "/cloudflare/status")
     async def _status_handler(self, _: Request) -> Response:

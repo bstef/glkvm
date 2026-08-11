@@ -26,6 +26,7 @@ import pprint
 import time
 
 import pyudev
+import asyncio
 
 from ..kvmd.switch.sysfs_device import Device
 from ..kvmd.switch.proto import Edid
@@ -146,7 +147,7 @@ def main() -> None:  # pylint: disable=too-many-statements
                 device.request_reboot(opts.unit, (opts.cmd == "bootloader"))
                 raise SystemExit()
             case "switch":
-                wait_rid = device.request_switch(0, opts.port)
+                wait_rid = asyncio.run(device.async_request_switch(0, opts.port))
                 raise SystemExit()
             case "leds":
                 wait_rid = device.request_atx_leds()

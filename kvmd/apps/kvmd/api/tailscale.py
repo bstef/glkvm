@@ -28,8 +28,10 @@ import json
 import os
 import ipaddress
 
+import aiohttp
 from aiohttp.web import Request, Response
 
+from .... import htclient
 from ....htserver import (
     BadRequestError,
     exposed_http,
@@ -37,8 +39,17 @@ from ....htserver import (
     make_json_exception,
 )
 from ....logging import get_logger
+from .common import is_process_running_by_name, read_json_file, run_command, update_json_file
 
 logger = get_logger()
+
+# tailscaled 的 LocalAPI：tailscale CLI 本身也只是这个 socket 的一层壳，
+# 直接请求可以省掉每次 fork 一个 Go 二进制的开销。
+_TAILSCALED_SOCK_PATH = "/var/run/tailscale/tailscaled.sock"
+_TAILSCALED_PID_PATH = "/var/run/tailscaled.pid"
+# tailscaled 会校验 Host 头，写成别的值（比如 localhost）会返回 403 invalid localapi request
+_LOCALAPI_HOST = "local-tailscaled.sock"
+_LOCALAPI_TIMEOUT = 5.0
 
 
 class TailscaleApi:
@@ -55,38 +66,38 @@ class TailscaleApi:
         }
 
     async def _run_command(self, cmd: str) -> str:
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd.split(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            if process.returncode != 0:
-                self._logger.error(f"Command failed: {stderr.decode()}")
-                raise BadRequestError()
-            return stdout.decode().strip()
-        except Exception as e:
-            self._logger.error(f"Error executing command: {e}")
-            raise BadRequestError()
+        return await run_command(cmd, logger=self._logger, error_status="")
     
+    async def _localapi_get(self, path: str) -> Dict:
+        """
+        请求 tailscaled 的 LocalAPI，等价于：
+            curl --unix-socket /var/run/tailscale/tailscaled.sock \\
+              http://local-tailscaled.sock<path>
+        """
+        async with aiohttp.ClientSession(
+            headers={"User-Agent": htclient.make_user_agent("KVMD")},
+            connector=aiohttp.UnixConnector(path=_TAILSCALED_SOCK_PATH),
+            timeout=aiohttp.ClientTimeout(total=_LOCALAPI_TIMEOUT),
+        ) as session:
+            async with session.get(f"http://{_LOCALAPI_HOST}{path}") as resp:
+                htclient.raise_not_200(resp)
+                return await resp.json()
+
     async def _get_tailscale_status(self) -> Dict:
         """
         获取Tailscale的状态信息
-        通过运行 tailscale status --json 获取
+        直接读 tailscaled 的 LocalAPI /localapi/v0/status，
+        返回内容与 tailscale status --json 完全一致
         """
         try:
-            cmd = "tailscale status --json"
-            output = await self._run_command(cmd)
-            status_data = json.loads(output)
-            return status_data
+            return await self._localapi_get("/localapi/v0/status")
         except json.JSONDecodeError as e:
             self._logger.error(f"Failed to parse Tailscale status JSON: {e}")
             raise BadRequestError(f"Invalid JSON response from Tailscale: {e}")
         except Exception as e:
             self._logger.error(f"Error getting Tailscale status: {e}")
             raise BadRequestError(f"Failed to get Tailscale status: {e}")
-            
+
     async def _start_login_process(self) -> str:
         """
         启动登录进程，获取URL后立即返回，但保持进程在后台运行
@@ -185,20 +196,7 @@ class TailscaleApi:
             self._logger.error(f"Error while waiting for Tailscale login: {e}")
 
     async def _check_tailscald_process(self) -> bool:
-        """
-        检查 tailscald 进程是否存在
-        """
-        try:
-            process = await asyncio.create_subprocess_exec(
-                "pidof", "tailscaled",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            return process.returncode == 0
-        except Exception as e:
-            self._logger.error(f"Error checking tailscald process: {e}")
-            return False
+        return is_process_running_by_name("tailscaled", pid_path=_TAILSCALED_PID_PATH, logger=self._logger)
 
     @exposed_http("GET", "/tailscale/status")
     async def _status_handler(self, _: Request) -> Response:
@@ -209,67 +207,31 @@ class TailscaleApi:
             self._logger.error(f"Error checking Tailscale status: {e}")
             return make_json_exception(BadRequestError(), 502)
 
+    @exposed_http("GET","/tailscale/gui_status",allowed_exe_paths=["/usr/sbin/gl_kvm_gui"])
+    async def _gui_get_status(self, request: Request) -> Response:
+        return await self._status_handler(request)
+
     async def _update_config_file(self, enable: bool) -> None:
-        """
-        更新Tailscale配置文件
-        
-        Args:
-            enable: True表示启用Tailscale，False表示禁用
-        """
-        config_path = self.__config_path
-        config_dir = os.path.dirname(config_path)
-        
-        # 确保目录存在
-        try:
-            os.makedirs(config_dir, exist_ok=True)
-        except Exception as e:
-            self._logger.error(f"Failed to create config directory {config_dir}: {e}")
-            raise BadRequestError(f"Failed to create config directory: {e}")
-        
-        # 写入配置文件
-        try:
-            config = {
-                "enable": enable
-            }
-            
-            with open(config_path, "w") as f:
-                json.dump(config, f, indent=4)
-            await asyncio.create_subprocess_shell("sync")
-                
-            self._logger.info(f"Updated Tailscale config file: enable={enable}")
-        except Exception as e:
-            self._logger.error(f"Failed to write config file {config_path}: {e}")
-            raise BadRequestError(f"Failed to write config file: {e}")
+        config = await update_json_file(
+            self.__config_path,
+            {"enable": False},
+            {"enable": enable},
+            logger=self._logger,
+        )
+        self._logger.info(f"Updated Tailscale config file: enable={config.get('enable')}")
 
     async def _read_config_file(self) -> Dict:
-        """
-        读取Tailscale配置文件
-        """
-        config_path = self.__config_path
-        
-        # 默认配置
-        default_config = {
-            "enable": False,
-            "exit_node": False, 
-            "advertise_routes": "",
-            "accept_routes": False,
-            "accept_dns": False
-        }
-        
-        try:
-            if os.path.exists(config_path):
-                with open(config_path, "r") as f:
-                    config = json.load(f)
-                    # 使用默认值填充缺失的配置项
-                    default_config["enable"] = config.get("enable", False)
-                    default_config["exit_node"] = config.get("exit_node", False)
-                    default_config["advertise_routes"] = config.get("advertise_routes", "")
-                    default_config["accept_routes"] = config.get("accept_routes", False) 
-                    default_config["accept_dns"] = config.get("accept_dns", False)
-            return default_config
-        except Exception as e:
-            self._logger.error(f"Failed to read config file {config_path}: {e}")
-            return default_config
+        return await read_json_file(
+            self.__config_path,
+            {
+                "enable": False,
+                "exit_node": False,
+                "advertise_routes": "",
+                "accept_routes": False,
+                "accept_dns": False,
+            },
+            logger=self._logger,
+        )
 
     async def _update_tailscale_config_file(self, 
                                           enable: Optional[bool] = None,
@@ -277,51 +239,25 @@ class TailscaleApi:
                                           advertise_routes: Optional[str] = None,
                                           accept_routes: Optional[bool] = None,
                                           accept_dns: Optional[bool] = None) -> None:
-        """
-        更新Tailscale配置文件，保存各种配置参数
-        
-        Args:
-            enable: True表示启用Tailscale，False表示禁用，None表示不更改
-            exit_node: 是否设置为exit node，None表示不更改
-            advertise_routes: 要广播的路由，None表示不更改
-            accept_routes: 是否接受路由，None表示不更改
-            accept_dns: 是否接受DNS，None表示不更改
-        """
-        config_path = self.__config_path
-        config_dir = os.path.dirname(config_path)
-        
-        # 确保目录存在
-        try:
-            os.makedirs(config_dir, exist_ok=True)
-        except Exception as e:
-            self._logger.error(f"Failed to create config directory {config_dir}: {e}")
-            raise BadRequestError(f"Failed to create config directory: {e}")
-        
-        # 读取现有配置
-        config = await self._read_config_file()
-        
-        # 更新配置
-        if enable is not None:
-            config["enable"] = enable
-        if exit_node is not None:
-            config["exit_node"] = exit_node
-        if advertise_routes is not None:
-            config["advertise_routes"] = advertise_routes
-        if accept_routes is not None:
-            config["accept_routes"] = accept_routes
-        if accept_dns is not None:
-            config["accept_dns"] = accept_dns
-        
-        # 写入配置文件
-        try:
-            with open(config_path, "w") as f:
-                json.dump(config, f, indent=4)
-            await asyncio.create_subprocess_shell("sync")
-                
-            self._logger.info(f"Updated Tailscale config file: {config}")
-        except Exception as e:
-            self._logger.error(f"Failed to write config file {config_path}: {e}")
-            raise BadRequestError(f"Failed to write config file: {e}")
+        config = await update_json_file(
+            self.__config_path,
+            {
+                "enable": False,
+                "exit_node": False,
+                "advertise_routes": "",
+                "accept_routes": False,
+                "accept_dns": False,
+            },
+            {
+                "enable": enable,
+                "exit_node": exit_node,
+                "advertise_routes": advertise_routes,
+                "accept_routes": accept_routes,
+                "accept_dns": accept_dns,
+            },
+            logger=self._logger,
+        )
+        self._logger.info(f"Updated Tailscale config file: {config}")
 
     @exposed_http("POST", "/tailscale/start")
     async def _start_handler(self, _: Request) -> Response:
@@ -350,6 +286,10 @@ class TailscaleApi:
             self._logger.error(f"Error starting Tailscale service: {e}")
             return make_json_exception(BadRequestError(), 502)
 
+    @exposed_http("POST","/tailscale/gui_start",allowed_exe_paths=["/usr/sbin/gl_kvm_gui"])
+    async def _gui_start_handler(self,request:Request) -> Response:
+        return await self._start_handler(request)
+
     @exposed_http("POST", "/tailscale/stop")
     async def _stop_handler(self, _: Request) -> Response:
         """
@@ -376,6 +316,10 @@ class TailscaleApi:
         except Exception as e:
             self._logger.error(f"Error stopping Tailscale service: {e}")
             return make_json_exception(BadRequestError(), 502)
+
+    @exposed_http("POST","/tailscale/gui_stop",allowed_exe_paths=["/usr/sbin/gl_kvm_gui"])
+    async def _gui_stop_handler(self,request:Request) -> Response:
+        return await self._stop_handler(request)
 
     @exposed_http("GET", "/tailscale/login_url")
     async def _login_url_handler(self, _: Request) -> Response:
@@ -453,12 +397,19 @@ class TailscaleApi:
         except Exception as e:
             self._logger.error(f"Error getting Tailscale login URL: {e}")
             return make_json_exception(BadRequestError(), 502)
-            
+
+    @exposed_http("GET","/tailscale/gui_login_url",allowed_exe_paths=["/usr/sbin/gl_kvm_gui"])
+    async def _gui_login_url_handler(self,request:Request) ->Response:
+        return await self._login_url_handler(request)
+
+
     @exposed_http("GET", "/tailscale/login_status")
     async def _login_status_handler(self, _: Request) -> Response:
         """
         获取Tailscale的登录状态
-        使用tailscale status --json获取BackendState字段
+        使用 tailscale status --json 获取 BackendState 字段
+        （等价于 curl --unix-socket /var/run/tailscale/tailscaled.sock \\
+          http://local-tailscaled.sock/localapi/v0/status）
         """
         try:
             # 检查tailscale是否启动
@@ -496,6 +447,7 @@ class TailscaleApi:
             
             # 尝试获取登录名
             try:
+                login_name = None
                 if "User" in status_data and status_data["User"]:
                     # 获取当前登录用户
                     if "Self" in status_data and status_data["Self"]:
@@ -535,6 +487,10 @@ class TailscaleApi:
             self._logger.error(f"Error getting Tailscale login status: {e}")
             return make_json_exception(BadRequestError(), 502)
 
+    @exposed_http("GET", "/tailscale/gui_login_status",allowed_exe_paths=["/usr/sbin/gl_kvm_gui"])
+    async def _gui_login_status_handler(self,request:Request) -> Response:
+        return await self._login_status_handler(request)
+
     @exposed_http("POST", "/tailscale/logout")
     async def _logout_handler(self, _: Request) -> Response:
         """
@@ -565,6 +521,10 @@ class TailscaleApi:
         except Exception as e:
             self._logger.error(f"Error logging out from Tailscale: {e}")
             return make_json_exception(BadRequestError(), 502)
+
+    @exposed_http("POST", "/tailscale/gui_logout",allowed_exe_paths=["/usr/sbin/gl_kvm_gui"])
+    async def _gui_logout_handler(self, request: Request) -> Response:
+        return await self._logout_handler(request)
 
     async def _get_interface_subnets(self) -> List[str]:
         """
@@ -749,6 +709,10 @@ class TailscaleApi:
             self._logger.error(f"Error configuring Tailscale parameters: {e}")
             return make_json_exception(BadRequestError(), 502)
 
+    @exposed_http("POST", "/tailscale/gui_config",allowed_exe_paths=["/usr/sbin/gl_kvm_gui"])
+    async def _gui_config_handler(self, request: Request) -> Response:
+        return await self._config_handler(request)
+
     @exposed_http("GET", "/tailscale/config")
     async def _get_config_handler(self, _: Request) -> Response:
         """
@@ -763,3 +727,7 @@ class TailscaleApi:
         except Exception as e:
             self._logger.error(f"Error reading Tailscale config: {e}")
             return make_json_exception(BadRequestError(), 502)
+
+    @exposed_http("GET","/tailscale/gui_config",allowed_exe_paths=["/usr/sbin/gl_kvm_gui"])
+    async def _gui_get_config_handler(self,request:Request) ->Response:
+        return await self._get_config_handler(request)

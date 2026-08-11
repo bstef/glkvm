@@ -126,7 +126,14 @@ def main(argv: (list[str] | None)=None) -> None:
         ),
         init_manager=InitManager(),
         info_manager=InfoManager(global_config),
-        log_reader=(LogReader() if config.log_reader.enabled else None),
+        log_reader=(
+            LogReader(
+                log_file=config.log_reader.path,
+                max_bytes=config.log_reader.max_bytes,
+                backup_count=config.log_reader.backup_count,
+            )
+            if config.log_reader.enabled else None
+        ),
         user_gpio=UserGpio(config.gpio, global_config.otg),
         ocr=Ocr(**config.ocr._unpack()),
         #switch=None,

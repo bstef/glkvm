@@ -26,7 +26,6 @@ from typing import Dict, Optional, List
 import threading
 import time
 import json
-import os
 import ipaddress
 from urllib.parse import urlparse
 
@@ -40,8 +39,13 @@ from ....htserver import (
     make_json_exception,
 )
 from ....logging import get_logger
+from .common import is_process_running_by_name, read_json_file, update_json_file
+from .netbird_daemon import NetbirdDaemonClient, NetbirdDaemonUnavailableError
 
 logger = get_logger()
+
+# S99netbird 用 start-stop-daemon -m -p 写这个 pidfile
+_NETBIRD_PID_PATH = "/var/run/netbird.pid"
 
 class NetbirdApi:
     __config_path = "/etc/kvmd/user/netbird.json"
@@ -49,6 +53,7 @@ class NetbirdApi:
         self._logger = logger
         self.login_status = None
         self._background_tasks: set = set()  # 防止后台任务被 GC 回收
+        self._daemon = NetbirdDaemonClient(logger=self._logger)
 
     async def _run_command(self, cmd: str):
         try:
@@ -71,22 +76,6 @@ class NetbirdApi:
         except Exception as e:
             self._logger.error(f'{cmd} except: {e}')
             return str(e)
-
-    async def is_netbird_running(self) -> bool:
-        try:
-            process = await asyncio.create_subprocess_exec(
-                "ps", "-ef",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            stdout, _ = await process.communicate()
-            for line in stdout.decode().splitlines():
-                if "netbird" in line and "grep" not in line:
-                    return True
-            return False
-        except Exception as e:
-            self._logger.error(f"is_netbird_running except: {e}")
-            return False
 
     _SETUP_KEY_PATTERN = re.compile(r'^[0-9A-Za-z\-]+$')
 
@@ -158,68 +147,30 @@ class NetbirdApi:
         return ret
 
     async def netbird_is_running(self) -> bool:
-        """
-        检查 netbird 进程是否存在
-        """
-        try:
-            process = await asyncio.create_subprocess_exec(
-                "pidof", "netbird",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            return process.returncode == 0
-        except Exception as e:
-            self._logger.error(f"Error checking netbird process: {e}")
-            return False
+        # 读 pidfile + /proc/<pid>/comm，省掉每次 fork pidof 的 ~28ms。
+        # S99netbird stop 会删掉 pidfile，所以没有 pidfile 就是没在跑，不必扫 /proc
+        return is_process_running_by_name(
+            "netbird",
+            pid_path=_NETBIRD_PID_PATH,
+            scan_fallback=False,
+            logger=self._logger,
+        )
 
     async def _read_config_file(self) -> dict:
-        config_path = self.__config_path
-        try:
-            if os.path.exists(config_path):
-                with open(config_path, "r") as f:
-                    config = json.load(f)
-                config.setdefault("enable", False)
-                config.setdefault("management_url", "")
-                return config
-        except Exception as e:
-            self._logger.error(f"Failed to read config file {config_path}: {e}")
-        return {"enable": False, "management_url": ""}
+        return await read_json_file(
+            self.__config_path,
+            {"enable": False, "management_url": ""},
+            logger=self._logger,
+        )
 
     async def _update_config_file(self, enable: Optional[bool] = None, management_url: Optional[str] = None) -> None:
-        """
-        更新Netbird配置文件
-
-        Args:
-            enable: True表示启用Netbird，False表示禁用，None表示不修改
-            management_url: 自部署管理服务器URL，None表示不修改，空字符串表示使用官方默认
-        """
-        config_path = self.__config_path
-        config_dir = os.path.dirname(config_path)
-
-        # 确保目录存在
-        try:
-            os.makedirs(config_dir, exist_ok=True)
-        except Exception as e:
-            self._logger.error(f"Failed to create config directory {config_dir}: {e}")
-            raise BadRequestError(f"Failed to create config directory: {e}")
-
-        # 写入配置文件
-        try:
-            config = await self._read_config_file()
-            if enable is not None:
-                config["enable"] = enable
-            if management_url is not None:
-                config["management_url"] = management_url
-
-            with open(config_path, "w") as f:
-                json.dump(config, f, indent=4)
-            await asyncio.create_subprocess_shell("sync")
-
-            self._logger.info(f"Updated Netbird config file: enable={config.get('enable')}, management_url={config.get('management_url')}")
-        except Exception as e:
-            self._logger.error(f"Failed to write config file {config_path}: {e}")
-            raise BadRequestError(f"Failed to write config file: {e}")
+        config = await update_json_file(
+            self.__config_path,
+            {"enable": False, "management_url": ""},
+            {"enable": enable, "management_url": management_url},
+            logger=self._logger,
+        )
+        self._logger.info(f"Updated Netbird config file: enable={config.get('enable')}, management_url={config.get('management_url')}")
 
     @exposed_http("POST", "/netbird/start")
     async def _netbird_start(self, _: Request) -> Response:
@@ -233,6 +184,8 @@ class NetbirdApi:
             # 启动服务
             cmd = "/etc/init.d/S99netbird start"
             output = await self._run_command(cmd)
+            # daemon 换了新进程和新 socket，丢掉旧 channel 让下次请求重新 dial
+            await self._daemon.close()
             # 等待服务启动
             await asyncio.sleep(2)
             # 检查服务是否真的启动了
@@ -248,6 +201,10 @@ class NetbirdApi:
             self._logger.error(f"Error starting Netbird service: {e}")
             return make_json_exception(BadRequestError(), 500)
 
+    @exposed_http("POST","/netbird/gui_start",allowed_exe_paths=["/usr/sbin/gl_kvm_gui"])
+    async def _gui_netbird_start(self, request: Request) -> Response:
+        return await self._netbird_start(request)
+
     @exposed_http("POST", "/netbird/stop")
     async def _netbird_stop(self, _: Request) -> Response:
         """
@@ -260,7 +217,15 @@ class NetbirdApi:
             # 停止服务
             cmd = "/etc/init.d/S99netbird stop"
             output = await self._run_command(cmd)
+            await self._daemon.close()
+            await asyncio.sleep(2)
             running = await self.netbird_is_running()
+            # init 脚本只停止它管理的 daemon，_get_login_url 启动的 netbird up
+            # 进程可能仍在运行，需要强制清理所有残留进程
+            if running:
+                await self._run_command("killall -q netbird")
+                await asyncio.sleep(1)
+                running = await self.netbird_is_running()
             return make_json_response({
                 "success": not running,
                 "err_msg": "" if not running else output,
@@ -271,6 +236,10 @@ class NetbirdApi:
         except Exception as e:
             self._logger.error(f"Error stopping Netbird service: {e}")
             return make_json_exception(BadRequestError(), 500)
+
+    @exposed_http("POST","/netbird/gui_stop",allowed_exe_paths=["/usr/sbin/gl_kvm_gui"])
+    async def _gui_netbird_stop(self, request: Request) -> Response:
+        return await self._netbird_stop(request)
 
     @exposed_http("POST", "/netbird/login")
     async def _netbird_login(self, request: Request) -> Response:
@@ -318,6 +287,10 @@ class NetbirdApi:
             self._logger.error(f'except: {e}')
             return make_json_exception(BadRequestError(), 500)
 
+    @exposed_http("POST", "/netbird/gui_login", allowed_exe_paths=["/usr/sbin/gl_kvm_gui"])
+    async def _gui_netbird_login(self, request: Request) -> Response:
+        return await self._netbird_login(request)
+
     @exposed_http("POST", "/netbird/logout")
     async def _netbird_logout(self, _: Request) -> Response:
         if not await self.netbird_is_running():
@@ -332,6 +305,10 @@ class NetbirdApi:
             self._logger.error(f'except: {e}')
             return make_json_exception(BadRequestError(), 500)
 
+    @exposed_http("POST", "/netbird/gui_logout", allowed_exe_paths=["/usr/sbin/gl_kvm_gui"])
+    async def _gui_netbird_logout(self, request: Request) -> Response:
+        return await self._netbird_logout(request)
+
     @exposed_http("GET", "/netbird/config")
     async def _netbird_get_config(self, _: Request) -> Response:
         try:
@@ -343,6 +320,10 @@ class NetbirdApi:
         except Exception as e:
             self._logger.error(f"Error reading Netbird config: {e}")
             return make_json_exception(BadRequestError(), 500)
+
+    @exposed_http("GET", "/netbird/gui_config", allowed_exe_paths=["/usr/sbin/gl_kvm_gui"])
+    async def _gui_netbird_get_config(self, request: Request) -> Response:
+        return await self._netbird_get_config(request)
 
     @exposed_http("POST", "/netbird/config")
     async def _netbird_set_config(self, request: Request) -> Response:
@@ -388,6 +369,10 @@ class NetbirdApi:
             self._logger.error(f"Error setting Netbird config: {e}")
             return make_json_exception(BadRequestError(), 500)
 
+    @exposed_http("POST", "/netbird/gui_config", allowed_exe_paths=["/usr/sbin/gl_kvm_gui"])
+    async def _gui_netbird_set_config(self, request: Request) -> Response:
+        return await self._netbird_set_config(request)
+
     @exposed_http("GET", "/netbird/get_info")
     async def _netbird_get_info(self, _: Request) -> Response:
         running = await self.netbird_is_running()
@@ -401,6 +386,38 @@ class NetbirdApi:
                 "err_msg": "",
             })
 
+        try:
+            status = await self._daemon.get_status()
+        except NetbirdDaemonUnavailableError as e:
+            # 进程还在但 socket 已经没了：daemon 正在退出，或者只剩 netbird up 的残留进程。
+            # 与旧实现（CLI 连不上 daemon 时输出非 JSON）保持同样的响应
+            self._logger.warning(f'netbird daemon is not reachable: {e}')
+            return make_json_response({
+                "running": True,
+                "netbird_ip": "",
+                "connected": False,
+                "success": False,
+                "err_msg": "netbird not logged in",
+            })
+        except ImportError as e:
+            # rootfs 里没有 grpcio，退回 CLI，别让整个 VPN 面板不可用
+            self._logger.warning(f'grpc is unavailable ({e}), falling back to netbird CLI')
+            return await self._netbird_get_info_via_cli()
+        except Exception as e:
+            self._logger.error(f'netbird daemon status failed: {e}')
+            return make_json_exception(UnavailableError(), 503)
+
+        # 未登录时 daemon 返回的 IP 为空、connected 为 false，与 CLI 的 JSON 输出一致，
+        # 所以这里不额外区分登录态，保持响应结构不变
+        return make_json_response({
+            "running": True,
+            "netbird_ip": status.ip,
+            "connected": status.connected,
+            "success": True,
+            "err_msg": "",
+        })
+
+    async def _netbird_get_info_via_cli(self) -> Response:
         cmd = 'netbird status --json'
         cmd_ret = await self._run_command(cmd)
 
@@ -425,6 +442,20 @@ class NetbirdApi:
                     "success": True,
                     "err_msg": "",
                 })
+        except json.JSONDecodeError as e:
+            # daemon 已停止时 netbird status --json 输出非 JSON 错误文本
+            self._logger.warning(f'netbird status output is not valid JSON: {cmd_ret!r}, error: {e}')
+            return make_json_response({
+                "running": True,
+                "netbird_ip": "",
+                "connected": False,
+                "success": False,
+                "err_msg": "netbird not logged in",
+            })
         except Exception as e:
             self._logger.error(f'except: {e}')
             return make_json_exception(UnavailableError(), 503)
+
+    @exposed_http("GET", "/netbird/gui_get_info", allowed_exe_paths=["/usr/sbin/gl_kvm_gui"])
+    async def _gui_netbird_get_info(self, request: Request) -> Response:
+        return await self._netbird_get_info(request)

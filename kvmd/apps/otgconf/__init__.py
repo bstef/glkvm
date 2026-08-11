@@ -22,6 +22,7 @@
 
 import os
 import json
+import errno
 import contextlib
 import dataclasses
 import argparse
@@ -36,6 +37,7 @@ from ...validators.basic import valid_stripped_string_not_empty
 from ... import usb
 
 from .. import init
+from ..otg import mtp
 
 
 # =====
@@ -87,6 +89,10 @@ class _GadgetControl:
 
         dwc3_name: (str | None) = None
         driver_dir: (str | None) = None
+        previous_functions = {
+            func for func in os.listdir(self.__get_fdest_path())
+            if os.path.islink(self.__get_fdest_path(func))
+        }
 
         if enabled:
             # 在 unbind 之前获取 dwc3 信息（unbind 后 driver 软链接消失）
@@ -107,6 +113,26 @@ class _GadgetControl:
             yield
         finally:
             self.__clear_profile(recreate=True)
+            mtp_error: (Exception | None) = None
+            mtp_enabled = os.path.islink(self.__get_fdest_path("ffs.mtp"))
+            try:
+                if mtp_enabled:
+                    mtp.prepare(self.__init_delay)
+                else:
+                    mtp.cleanup()
+            except Exception as ex:
+                mtp_error = ex
+                # 恢复调用前的整个 profile，避免失败请求连带改变其他 OTG function。
+                self.__clear_profile(recreate=False)
+                for func in self.__read_metas():
+                    if func.name in previous_functions:
+                        os.symlink(self.__get_fsrc_path(func.name), self.__get_fdest_path(func.name))
+                if "ffs.mtp" in previous_functions:
+                    try:
+                        mtp.prepare(self.__init_delay)
+                    except Exception:
+                        with contextlib.suppress(FileNotFoundError):
+                            os.unlink(self.__get_fdest_path("ffs.mtp"))
             # Only restart UDC if there is at least one function in the profile.
             # Writing UDC with an empty config causes kernel EINVAL (-22).
             has_functions = any(
@@ -124,8 +150,18 @@ class _GadgetControl:
                         if os.path.exists(usb.get_udc_path(udc)):
                             break
                         time.sleep(0.05)
-                with open(udc_path, "w") as file:
-                    file.write(udc)
+                deadline = time.monotonic() + self.__init_delay
+                while True:
+                    try:
+                        with open(udc_path, "w") as file:
+                            file.write(udc)
+                        break
+                    except OSError as ex:
+                        if ex.errno != errno.EBUSY or time.monotonic() >= deadline:
+                            raise
+                        time.sleep(0.1)
+            if mtp_error is not None:
+                raise mtp_error
 
     def __clear_profile(self, recreate: bool) -> None:
         # XXX: See pikvm/pikvm#1235
@@ -180,8 +216,11 @@ class _GadgetControl:
 
     def change_functions(self, enable: set[str], disable: set[str]) -> None:
         funcs = list(self.__read_metas())  # 已按 meta order 排序
-        new: set[str] = set(func.name for func in funcs if func.enabled)
-        new = (new - disable) | enable
+        currently_enabled: set[str] = set(func.name for func in funcs if func.enabled)
+        new: set[str] = (currently_enabled - disable) | enable
+        # 目标状态与当前状态完全相同时，跳过 DWC3 unbind/rebind，避免 UVC fd 失效
+        if new == currently_enabled:
+            return
         eps_req = sum(func.eps for func in funcs if func.name in new)
         if eps_req > self.__eps:
             raise RuntimeError(f"No available endpoints for this config: {eps_req} required, {self.__eps} is maximum")

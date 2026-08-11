@@ -298,6 +298,17 @@ def set_request_auth_info(req: BaseRequest, info: str) -> None:
     setattr(req, _REQUEST_AUTH_INFO, info)
 
 
+# exe: 身份只由 allowed_exe_paths 白名单产生(见 api/auth.py),即本机进程
+# (gl_kvm_gui / gl-pion 等)经 Unix Socket 发起的内部 IPC 调用。这类请求多为
+# 高频轮询,出现在 HTTP access log 里只是噪音,统一丢弃。
+class FilteredAccessLogger(AccessLogger):
+    def log(self, request: BaseRequest, response: StreamResponse, time: float) -> None:  # type: ignore  # pylint: disable=redefined-outer-name
+        info = getattr(request, _REQUEST_AUTH_INFO, None) or ""
+        if info.startswith("exe:"):
+            return
+        super().log(request, response, time)
+
+
 @dataclasses.dataclass(frozen=True)
 class RequestUnixCredentials:
     pid: int
@@ -393,6 +404,7 @@ class HttpServer:
             sock=sock,
             app=self.__make_app(),
             shutdown_timeout=1,
+            access_log_class=FilteredAccessLogger,
             access_log_format=access_log_format,
             print=self.__run_app_print,
             loop=asyncio.get_event_loop(),

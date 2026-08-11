@@ -30,7 +30,20 @@ import tempfile
 import stat
 
 from ..htpasswd import _get_htpasswd_for_write_from_file
+from ...validators import ValidatorError
 from ...validators.auth import valid_passwd
+from ...validators.auth import valid_new_passwd
+
+
+# =====
+# 新密码不满足强密码规则(长度 10~63,且大写/小写/数字/特殊字符四类中至少两类)
+class WeakPasswordError(Exception):
+    pass
+
+
+# 旧密码错误(格式不合法或与当前密码不匹配)
+class InvalidOldPasswordError(Exception):
+    pass
 
 
 # =====
@@ -128,10 +141,12 @@ class InitManager:
             return
 
         try:
-            # 验证密码
-            if password != valid_passwd(password):
-                raise Exception("Password is required")
-            
+            # 验证密码(初始化密码需满足强密码规则)
+            try:
+                valid_new_passwd(password)
+            except ValidatorError:
+                raise WeakPasswordError("Password does not meet complexity requirements")
+
             # 使用htpasswd设置密码
             with _get_htpasswd_for_write_from_file("/etc/kvmd/user/htpasswd") as htpasswd:
                 htpasswd.set_password("admin", password)
@@ -152,28 +167,35 @@ class InitManager:
             raise
 
     def change_password(self, user: str, old_password: str, new_password: str) -> None:
+        # 旧密码沿用宽松规则(允许已有不符合强规则的旧密码),新密码必须满足强密码规则。
+        # 这些校验失败属于用户输入问题,不作为 ERROR 日志,交由上层映射成对应的 HTTP 响应。
         try:
-            # 验证新旧密码
-            if old_password != valid_passwd(old_password):
-                raise Exception("Old password is invalid")
-            if new_password != valid_passwd(new_password):
-                raise Exception("New password is invalid")
-            
+            valid_passwd(old_password)
+        except ValidatorError:
+            raise InvalidOldPasswordError("Old password is invalid")
+        try:
+            valid_new_passwd(new_password)
+        except ValidatorError:
+            raise WeakPasswordError("New password does not meet complexity requirements")
+
+        try:
             # 使用htpasswd验证旧密码并设置新密码
             with _get_htpasswd_for_write_from_file("/etc/kvmd/user/htpasswd") as htpasswd:
                 if not htpasswd.check_password(user, old_password):
-                    raise Exception("Invalid old password")
+                    raise InvalidOldPasswordError("Old password does not match")
                 htpasswd.set_password(user, new_password)
-            
+
             # 修改root用户的SSH密码
             try:
                 self._change_root_password(new_password)
             except Exception:
                 # 错误已在_change_root_password中记录
                 pass
-                
+
             get_logger().info("Password changed successfully")
-            
+
+        except InvalidOldPasswordError:
+            raise
         except Exception as e:
             get_logger().error(f"Failed to change password: {e}")
             raise

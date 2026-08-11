@@ -21,12 +21,10 @@
 
 
 import os
-import re
 import asyncio
 import aiofiles
 import json
 from typing import List, Dict
-import subprocess
 
 from aiohttp.web import Request, Response
 
@@ -37,18 +35,9 @@ from ....htserver import (
     make_json_exception,
 )
 from ....logging import get_logger
+from .common import make_device_name_from_mac, run_process, valid_mac
 
 logger = get_logger()
-
-_MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}$")
-
-
-def _valid_mac(mac: str) -> str:
-    """Validate and normalize a MAC address to prevent command injection."""
-    mac = mac.strip()
-    if not _MAC_RE.match(mac):
-        raise BadRequestError("Invalid MAC address format")
-    return mac
 
 
 class WolApi:
@@ -57,23 +46,7 @@ class WolApi:
         self._wol_list_path = "/etc/kvmd/user/wol_list.json"
 
     async def _run_command_exec(self, cmd: list) -> str:
-        """Run command using exec (argument list) to avoid shell injection."""
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            if process.returncode != 0:
-                self._logger.error(f"Command failed: {stderr.decode()}")
-                raise BadRequestError()
-            return stdout.decode().strip()
-        except BadRequestError:
-            raise
-        except Exception as e:
-            self._logger.error(f"Error executing command: {e}")
-            raise BadRequestError()
+        return await run_process(cmd, logger=self._logger, error_status="")
 
     @exposed_http("GET", "/wol/scan")
     async def _arp_scan_handler(self, _: Request) -> Response:
@@ -122,7 +95,7 @@ class WolApi:
             if line.strip():
                 ip, mac = line.strip().split()
                 # 生成设备名称：device-后4位MAC地址
-                device_name = f"device-{mac.replace(':', '')[-4:]}"
+                device_name = make_device_name_from_mac(mac)
                 devices[mac] = {
                     "ip": ip,
                     "mac": mac,
@@ -166,7 +139,7 @@ class WolApi:
             mac = request.query.get("mac")
             if not mac:
                 raise BadRequestError("MAC address is required")
-            mac = _valid_mac(mac)
+            mac = valid_mac(mac)
 
             # Send WOL packets to all available interfaces
             interfaces = self._get_available_interfaces()
@@ -189,7 +162,7 @@ class WolApi:
             mac = request.query.get("mac")
             if not mac:
                 raise BadRequestError("MAC address is required")
-            mac = _valid_mac(mac)
+            mac = valid_mac(mac)
 
             # 获取可选参数
             ip = request.query.get("ip", "")

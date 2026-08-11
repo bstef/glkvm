@@ -216,14 +216,17 @@ class AuthApi:
                     raise ForbiddenError()
                 else:
                     # Original single-step login
-                    token = await self.__auth_manager.login(
+                    (token, failed_since_last_success) = await self.__auth_manager.login(
                         user=user,
                         passwd=passwd,
                         expire=expire,
                         client_ip=client_ip,
                     )
                     if token:
-                        return make_json_response({"token": token}, set_cookies={_COOKIE_AUTH_TOKEN: token})
+                        return make_json_response({
+                            "token": token,
+                            "failed_since_last_success": failed_since_last_success,
+                        }, set_cookies={_COOKIE_AUTH_TOKEN: token})
                     raise ForbiddenError()
             except RateLimitError as ex:
                 # Return 429 Too Many Requests for rate limiting
@@ -268,9 +271,12 @@ class AuthApi:
                     "error_msg": "Missing two_step_token parameter"
                 }, status=400)
 
-            token, status = self.__auth_manager.complete_two_step_login(two_step_token)
+            (token, status, failed_since_last_success) = self.__auth_manager.complete_two_step_login(two_step_token)
             if status == "ok":
-                return make_json_response({"token": token}, set_cookies={_COOKIE_AUTH_TOKEN: token})
+                return make_json_response({
+                    "token": token,
+                    "failed_since_last_success": failed_since_last_success,
+                }, set_cookies={_COOKIE_AUTH_TOKEN: token})
             elif status == "pending":
                 return make_json_response({"status": "pending"})
             else:
@@ -346,14 +352,14 @@ class AuthApi:
                 # If no specific client_ip provided, use requesting client's IP
                 client_ip = self.__auth_manager._get_client_ip(dict(req.headers))
 
-            status = self.__auth_manager.get_rate_limit_status(client_ip)
+            status = await self.__auth_manager.get_rate_limit_status(client_ip)
             return make_json_response(status)
         return make_json_response({"enabled": False})
 
     @exposed_http("GET", "/auth/locked_clients")
     async def __locked_clients_handler(self, _: Request) -> Response:
         if self.__auth_manager.is_auth_enabled():
-            locked_clients = self.__auth_manager.get_all_locked_clients()
+            locked_clients = await self.__auth_manager.get_all_locked_clients()
             return make_json_response({"locked_clients": locked_clients})
         return make_json_response({"enabled": False, "locked_clients": {}})
 
@@ -368,7 +374,7 @@ class AuthApi:
                     "error_msg": "Missing client_ip parameter"
                 }, status=400)
 
-            unlocked = self.__auth_manager.unlock_client(client_ip)
+            unlocked = await self.__auth_manager.unlock_client(client_ip)
             return make_json_response({
                 "unlocked": unlocked,
                 "client_ip": client_ip

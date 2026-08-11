@@ -80,7 +80,8 @@ def _load_libtesseract() -> (ctypes.CDLL | None):
                     path = candidate
                     break
             if not path:
-                raise RuntimeError("Can't find libtesseract")
+                # libtesseract 未安装属于预期情况(本机型走 RKNN OCR),静默降级
+                return None
         lib = ctypes.CDLL(path)
         for (name, restype, argtypes) in [
             ("TessBaseAPICreate", POINTER(_TessBaseAPI), []),

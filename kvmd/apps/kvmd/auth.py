@@ -26,7 +26,6 @@ import grp
 import dataclasses
 import time
 import datetime
-import threading
 
 import secrets
 import pyotp
@@ -35,6 +34,7 @@ import pyotp
 from ...logging import get_logger
 
 from ... import aiotools
+from ... import tools
 
 from ...plugins.auth import BaseAuthService
 from ...plugins.auth import get_auth_service_class
@@ -166,7 +166,11 @@ class AuthManager:  # pylint: disable=too-many-arguments,too-many-instance-attri
 
         # Rate limiting state
         self.__client_locks: dict[str, _ClientLockInfo] = {}  # {client_ip: lock_info}
-        self.__rate_limit_lock = threading.Lock()
+        self.__rate_limit_lock = asyncio.Lock()
+
+        # 自上一次登录成功以来的全局登录失败次数（仅内存，重启清零），
+        # 用于在登录成功时提示用户是否疑似遭遇暴力破解。
+        self.__failed_since_last_success = 0
 
         if self.__rate_limit_enabled:
             logger.info("Login rate limiting enabled: max_attempts=%d, time_window=%ds, lockout_duration=%ds",
@@ -223,7 +227,7 @@ class AuthManager:  # pylint: disable=too-many-arguments,too-many-instance-attri
             logger.error("Got access denied for user %r from auth service %r", user, pname)
         return ok
 
-    async def login(self, user: str, passwd: str, expire: int, client_ip: str = 'unknown') -> (str | None):
+    async def login(self, user: str, passwd: str, expire: int, client_ip: str = 'unknown') -> tuple[str | None, int]:
         assert user == user.strip()
         assert user
         assert expire >= 0
@@ -231,7 +235,7 @@ class AuthManager:  # pylint: disable=too-many-arguments,too-many-instance-attri
 
         # Check if client is rate limited
         if self.__rate_limit_enabled:
-            is_locked, remaining_time = self._is_client_locked(client_ip)
+            is_locked, remaining_time = await self._is_client_locked(client_ip)
             if is_locked:
                 get_logger(0).warning("Rate limit: Login attempt blocked for client %s, %d seconds remaining",
                                       client_ip, remaining_time)
@@ -242,7 +246,7 @@ class AuthManager:  # pylint: disable=too-many-arguments,too-many-instance-attri
 
         # Perform cleanup periodically (every 100th login attempt)
         if self.__rate_limit_enabled and hash(client_ip) % 100 == 0:
-            self._cleanup_expired_data()
+            await self._cleanup_expired_data()
 
         if (await self.authorize(user, passwd)):
             token = self.__make_new_token()
@@ -251,24 +255,33 @@ class AuthManager:  # pylint: disable=too-many-arguments,too-many-instance-attri
                 expire_ts=self.__make_expire_ts(expire),
             )
             self.__sessions[token] = session
-            get_logger(0).info("Logged in user %r; expire=%s, sessions_now=%d",
+            failed_since_last = self.__consume_failed_since_last_success()
+            get_logger(0).info("Logged in user %r; expire=%s, sessions_now=%d, failed_since_last_success=%d",
                                session.user,
                                self.__format_expire_ts(session.expire_ts),
-                               self.__get_sessions_number(session.user))
-            return token
+                               self.__get_sessions_number(session.user),
+                               failed_since_last)
+            return (token, failed_since_last)
         else:
+            self.__failed_since_last_success += 1
             # Record failed attempt for rate limiting
             if self.__rate_limit_enabled:
-                self._record_failed_attempt(client_ip)
+                await self._record_failed_attempt(client_ip)
                 # Check if client is now locked after this attempt
-                is_locked, remaining_time = self._is_client_locked(client_ip)
+                is_locked, remaining_time = await self._is_client_locked(client_ip)
                 if is_locked:
                     raise RateLimitError(
                         f"Account temporarily locked due to too many failed attempts. Please try again in {remaining_time} seconds.",
                         remaining_time
                     )
 
-        return None
+        return (None, 0)
+
+    def __consume_failed_since_last_success(self) -> int:
+        """返回自上一次登录成功以来累计的全局登录失败次数，并清零计数。"""
+        count = self.__failed_since_last_success
+        self.__failed_since_last_success = 0
+        return count
 
     def __make_new_token(self) -> str:
         for _ in range(10):
@@ -387,7 +400,7 @@ class AuthManager:  # pylint: disable=too-many-arguments,too-many-instance-attri
 
         # Check if client is rate limited
         if self.__rate_limit_enabled:
-            is_locked, remaining_time = self._is_client_locked(client_ip)
+            is_locked, remaining_time = await self._is_client_locked(client_ip)
             if is_locked:
                 get_logger(0).warning("Rate limit: Login attempt blocked for client %s, %d seconds remaining",
                                       client_ip, remaining_time)
@@ -419,14 +432,15 @@ class AuthManager:  # pylint: disable=too-many-arguments,too-many-instance-attri
             get_logger(0).info("Pre-login successful for user %r from %s; two_step_token issued, expires in %ds",
                                user, client_ip, self.__two_step_expire)
 
-            aiotools.create_short_task(asyncio.create_subprocess_shell("killall -SIGUSR2 gl_kvm_gui"))
+            aiotools.create_short_task(tools.run_command("killall", "-SIGUSR2", "gl_kvm_gui", timeout=5))
 
             return two_step_token
         else:
+            self.__failed_since_last_success += 1
             # Record failed attempt for rate limiting
             if self.__rate_limit_enabled:
-                self._record_failed_attempt(client_ip)
-                is_locked, remaining_time = self._is_client_locked(client_ip)
+                await self._record_failed_attempt(client_ip)
+                is_locked, remaining_time = await self._is_client_locked(client_ip)
                 if is_locked:
                     raise RateLimitError(
                         f"Account temporarily locked due to too many failed attempts. Please try again in {remaining_time} seconds.",
@@ -434,30 +448,30 @@ class AuthManager:  # pylint: disable=too-many-arguments,too-many-instance-attri
                     )
         return None
 
-    def complete_two_step_login(self, two_step_token: str) -> tuple[str | None, str]:
+    def complete_two_step_login(self, two_step_token: str) -> tuple[str | None, str, int]:
         """两步登录第二步：用临时 token 换取正式 token
-        返回 (token, status):
-            - (token, "ok")      — 审批通过，返回正式 token
-            - (None, "pending")  — 尚未审批，前端应继续轮询
-            - (None, "expired")  — 临时 token 已过期
-            - (None, "invalid")  — 临时 token 无效（不存在或已被拒绝）
+        返回 (token, status, failed_since_last_success):
+            - (token, "ok", N)   — 审批通过，返回正式 token，N 为自上次成功登录以来的失败次数
+            - (None, "pending", 0)  — 尚未审批，前端应继续轮询
+            - (None, "expired", 0)  — 临时 token 已过期
+            - (None, "invalid", 0)  — 临时 token 无效（不存在或已被拒绝）
         """
         assert self.__enabled
 
         session = self.__two_step_sessions.get(two_step_token)
         if session is None:
             get_logger(0).warning("Two-step login failed: invalid token")
-            return (None, "invalid")
+            return (None, "invalid", 0)
 
         current_time = time.time()
         if current_time > session.expire_ts:
             del self.__two_step_sessions[two_step_token]
             get_logger(0).warning("Two-step login failed: token expired for user %r", session.user)
-            return (None, "expired")
+            return (None, "expired", 0)
 
         # 检查是否已审批
         if not session.approved:
-            return (None, "pending")
+            return (None, "pending", 0)
 
         # Token valid and approved, remove it and issue real token
         del self.__two_step_sessions[two_step_token]
@@ -468,11 +482,13 @@ class AuthManager:  # pylint: disable=too-many-arguments,too-many-instance-attri
             expire_ts=self.__make_expire_ts(session.original_expire),
         )
         self.__sessions[token] = real_session
-        get_logger(0).info("Two-step login completed for user %r; expire=%s, sessions_now=%d",
+        failed_since_last = self.__consume_failed_since_last_success()
+        get_logger(0).info("Two-step login completed for user %r; expire=%s, sessions_now=%d, failed_since_last_success=%d",
                            real_session.user,
                            self.__format_expire_ts(real_session.expire_ts),
-                           self.__get_sessions_number(real_session.user))
-        return (token, "ok")
+                           self.__get_sessions_number(real_session.user),
+                           failed_since_last)
+        return (token, "ok", failed_since_last)
 
     def __make_new_two_step_token(self) -> str:
         for _ in range(10):
@@ -590,12 +606,12 @@ class AuthManager:  # pylint: disable=too-many-arguments,too-many-instance-attri
         # Fallback to a default identifier if no IP is available
         return 'unknown'
 
-    def _is_client_locked(self, client_ip: str) -> tuple[bool, int]:
+    async def _is_client_locked(self, client_ip: str) -> tuple[bool, int]:
         """Check if client is currently locked. Returns (is_locked, remaining_seconds)."""
         if not self.__rate_limit_enabled:
             return False, 0
 
-        with self.__rate_limit_lock:
+        async with self.__rate_limit_lock:
             lock_info = self.__client_locks.get(client_ip)
             if not lock_info:
                 return False, 0
@@ -611,13 +627,13 @@ class AuthManager:  # pylint: disable=too-many-arguments,too-many-instance-attri
                     del self.__client_locks[client_ip]
                 return False, 0
 
-    def _record_failed_attempt(self, client_ip: str) -> None:
+    async def _record_failed_attempt(self, client_ip: str) -> None:
         """Record a failed login attempt for the client."""
         if not self.__rate_limit_enabled:
             return
 
         current_time = time.time()
-        with self.__rate_limit_lock:
+        async with self.__rate_limit_lock:
             if client_ip not in self.__client_locks:
                 self.__client_locks[client_ip] = _ClientLockInfo(
                     locked_until=0,
@@ -650,7 +666,7 @@ class AuthManager:  # pylint: disable=too-many-arguments,too-many-instance-attri
                               self.__rate_limit_lockout_duration,
                               len(lock_info.failed_attempts))
 
-    def _cleanup_expired_data(self) -> None:
+    async def _cleanup_expired_data(self) -> None:
         """Clean up expired rate limiting data to prevent memory leaks."""
         if not self.__rate_limit_enabled:
             return
@@ -658,7 +674,7 @@ class AuthManager:  # pylint: disable=too-many-arguments,too-many-instance-attri
         current_time = time.time()
         cutoff_time = current_time - self.__rate_limit_time_window
 
-        with self.__rate_limit_lock:
+        async with self.__rate_limit_lock:
             clients_to_remove = []
             for client_ip, lock_info in self.__client_locks.items():
                 # Remove expired locks and old failed attempts
@@ -678,12 +694,12 @@ class AuthManager:  # pylint: disable=too-many-arguments,too-many-instance-attri
             for client_ip in clients_to_remove:
                 del self.__client_locks[client_ip]
 
-    def get_rate_limit_status(self, client_ip: str) -> dict:
+    async def get_rate_limit_status(self, client_ip: str) -> dict:
         """Get rate limiting status for a client (for monitoring/debugging)."""
         if not self.__rate_limit_enabled:
             return {"enabled": False}
 
-        with self.__rate_limit_lock:
+        async with self.__rate_limit_lock:
             lock_info = self.__client_locks.get(client_ip)
             if not lock_info:
                 return {
@@ -713,12 +729,12 @@ class AuthManager:  # pylint: disable=too-many-arguments,too-many-instance-attri
                 "remaining_attempts": max(0, self.__rate_limit_max_attempts - recent_attempts)
             }
 
-    def unlock_client(self, client_ip: str) -> bool:
+    async def unlock_client(self, client_ip: str) -> bool:
         """Manually unlock a client (for admin use). Returns True if client was unlocked."""
         if not self.__rate_limit_enabled:
             return False
 
-        with self.__rate_limit_lock:
+        async with self.__rate_limit_lock:
             lock_info = self.__client_locks.get(client_ip)
             if lock_info and lock_info.locked_until > time.time():
                 lock_info.locked_until = 0
@@ -727,7 +743,7 @@ class AuthManager:  # pylint: disable=too-many-arguments,too-many-instance-attri
                 return True
             return False
 
-    def get_all_locked_clients(self) -> dict[str, dict]:
+    async def get_all_locked_clients(self) -> dict[str, dict]:
         """Get status of all currently locked clients (for monitoring)."""
         if not self.__rate_limit_enabled:
             return {}
@@ -735,7 +751,7 @@ class AuthManager:  # pylint: disable=too-many-arguments,too-many-instance-attri
         current_time = time.time()
         locked_clients = {}
 
-        with self.__rate_limit_lock:
+        async with self.__rate_limit_lock:
             for client_ip, lock_info in self.__client_locks.items():
                 if lock_info.locked_until > current_time:
                     remaining_time = int(lock_info.locked_until - current_time)

@@ -21,6 +21,7 @@
 
 
 import os
+import time
 import signal
 import asyncio
 import asyncio.subprocess
@@ -174,6 +175,16 @@ class Streamer:  # pylint: disable=too-many-instance-attributes
     __ST_STREAMER = 0x02
     __ST_SNAPSHOT = 0x04
 
+    # How long a graceful stop may take before falling back to SIGKILL.
+    __GRACEFUL_STOP_TIMEOUT = 5.0
+
+    # Minimal streamer uptime before it may be signalled. Killing it while the
+    # RV1126B media stack is still initializing leaves the capture thread stuck
+    # in a kernel ioctl (D state, wchan=rkos_down) that ignores even SIGKILL,
+    # so the process can never be reaped and stays <defunct> until reboot.
+    # Measured: a kill 450-900ms after start hangs every time, 1200ms is safe.
+    __MIN_UPTIME_BEFORE_KILL = 2.0
+
     def __init__(  # pylint: disable=too-many-arguments,too-many-locals
         self,
 
@@ -225,11 +236,13 @@ class Streamer:  # pylint: disable=too-many-instance-attributes
         self.__need_flag_state: (bool | None) = None
 
         self.__stop_task: (asyncio.Task | None) = None
-        self.__stop_wip = False
 
         self.__streamer_task: (asyncio.Task | None) = None
         self.__streamer_proc: (asyncio.subprocess.Process | None) = None  # pylint: disable=no-member
-
+        self.__streamer_start_ts = 0.0
+        # Serializes ensure_start/ensure_stop so reset-delay sleep cannot race with
+        # systask's set_external_stream_required() (gl_webrtc adaptive-mode exit).
+        self.__proc_lock = asyncio.Lock()
 
         self.__client = HttpStreamerClient(
             name="jpeg",
@@ -247,26 +260,38 @@ class Streamer:  # pylint: disable=too-many-instance-attributes
 
     @aiotools.atomic_fg
     async def ensure_start(self, reset: bool) -> None:
+        async with self.__proc_lock:
+            await self.__ensure_start_locked(reset)
+
+    async def __ensure_start_locked(self, reset: bool) -> None:
         if not self.__streamer_task or self.__stop_task:
             logger = get_logger(0)
 
             if self.__stop_task:
-                if not self.__stop_wip:
-                    self.__stop_task.cancel()
-                    await asyncio.gather(self.__stop_task, return_exceptions=True)
-                    logger.info("Streamer stop cancelled")
-                    return
-                else:
-                    await asyncio.gather(self.__stop_task, return_exceptions=True)
+                # delayed_stop only ever holds __proc_lock while actually stopping, and we
+                # hold it here, so a pending stop_task is always still in its sleep phase:
+                # cancel it and treat the streamer as already running.
+                self.__stop_task.cancel()
+                await asyncio.gather(self.__stop_task, return_exceptions=True)
+                logger.info("Streamer stop cancelled")
+                return
 
             if reset and self.__reset_delay > 0:
                 logger.info("Waiting %.2f seconds for reset delay ...", self.__reset_delay)
                 await asyncio.sleep(self.__reset_delay)
+                # Defense in depth: if somehow already running after delay, do not double-start.
+                if self.__streamer_task and not self.__stop_task:
+                    logger.info("Streamer already running after reset delay, skip duplicate start")
+                    return
             logger.info("Starting streamer ...")
             await self.__inner_start()
 
     @aiotools.atomic_fg
-    async def ensure_stop(self, immediately: bool, *, force: bool=False) -> None:
+    async def ensure_stop(self, immediately: bool, *, force: bool=False, graceful: bool=False) -> None:
+        async with self.__proc_lock:
+            await self.__ensure_stop_locked(immediately, force=force, graceful=graceful)
+
+    async def __ensure_stop_locked(self, immediately: bool, *, force: bool=False, graceful: bool=False) -> None:
         if self.__streamer_task:
             logger = get_logger(0)
 
@@ -280,28 +305,25 @@ class Streamer:  # pylint: disable=too-many-instance-attributes
 
             if immediately:
                 if self.__stop_task:
-                    if not self.__stop_wip:
-                        self.__stop_task.cancel()
-                        await asyncio.gather(self.__stop_task, return_exceptions=True)
-                        logger.info("Stopping streamer immediately ...")
-                        await self.__inner_stop()
-                    else:
-                        await asyncio.gather(self.__stop_task, return_exceptions=True)
-                else:
-                    logger.info("Stopping streamer immediately ...")
-                    await self.__inner_stop()
+                    # See __ensure_start_locked: a pending stop_task is still in its
+                    # sleep phase here, so cancel it before stopping immediately.
+                    self.__stop_task.cancel()
+                    await asyncio.gather(self.__stop_task, return_exceptions=True)
+                logger.info("Stopping streamer immediately ...")
+                await self.__inner_stop(graceful=graceful)
 
             elif not self.__stop_task:
 
                 async def delayed_stop() -> None:
                     try:
                         await asyncio.sleep(self.__shutdown_delay)
-                        self.__stop_wip = True
-                        logger.info("Stopping streamer after delay ...")
-                        await self.__inner_stop()
+                        async with self.__proc_lock:
+                            if not self.__streamer_task:
+                                return
+                            logger.info("Stopping streamer after delay ...")
+                            await self.__inner_stop()
                     finally:
                         self.__stop_task = None
-                        self.__stop_wip = False
 
                 logger.info("Planning to stop streamer in %.2f seconds ...", self.__shutdown_delay)
                 self.__stop_task = asyncio.create_task(delayed_stop())
@@ -443,16 +465,18 @@ class Streamer:  # pylint: disable=too-many-instance-attributes
 
     @aiotools.atomic_fg
     async def __inner_start(self) -> None:
-        assert not self.__streamer_task
+        if self.__streamer_task:
+            return
         await self.__run_hook("PRE-START-CMD", self.__pre_start_cmd)
         self.__streamer_task = asyncio.create_task(self.__streamer_task_loop())
 
     @aiotools.atomic_fg
-    async def __inner_stop(self) -> None:
-        assert self.__streamer_task
+    async def __inner_stop(self, *, graceful: bool=False) -> None:
+        if not self.__streamer_task:
+            return
         self.__streamer_task.cancel()
         await asyncio.gather(self.__streamer_task, return_exceptions=True)
-        await self.__kill_streamer_proc()
+        await self.__kill_streamer_proc(graceful=graceful)
         await self.__run_hook("POST-STOP-CMD", self.__post_stop_cmd)
         self.__streamer_task = None
 
@@ -465,7 +489,6 @@ class Streamer:  # pylint: disable=too-many-instance-attributes
                 # /tmp/kvmd_janus_disable 由 server.py 在进入自适应模式时创建。
                 # 此时如果启动 ustreamer 会与 webrtc_client 争抚硬件导致崩溃。
                 if need_streamer and await aiotools.run_async(os.path.exists, "/tmp/kvmd_janus_disable"):
-                    logger.info("need_ustreamer=1 ignored: webrtc_client adaptive mode is active")
                     need_streamer = False
                 if need_streamer != self.__need_flag_state:
                     self.__need_flag_state = need_streamer
@@ -581,13 +604,42 @@ class Streamer:  # pylint: disable=too-many-instance-attributes
             logger.exception("Can't execute command: %s", ex)
 
     async def __start_streamer_proc(self) -> None:
-        assert self.__streamer_proc is None
+        if self.__streamer_proc is not None:
+            return
         cmd = self.__make_cmd(self.__cmd)
         self.__streamer_proc = await aioproc.run_process(cmd)
+        self.__streamer_start_ts = time.monotonic()
         get_logger(0).info("Started streamer pid=%d: %s", self.__streamer_proc.pid, tools.cmdfmt(cmd))
 
-    async def __kill_streamer_proc(self) -> None:
+    async def __wait_streamer_settled(self) -> None:
+        # See __MIN_UPTIME_BEFORE_KILL: signalling a half-initialized streamer
+        # wedges its capture thread in the kernel and leaks it as <defunct>.
+        assert self.__streamer_proc is not None
+        if self.__streamer_proc.returncode is not None:
+            return  # Already gone, nothing to protect
+        delay = self.__MIN_UPTIME_BEFORE_KILL - (time.monotonic() - self.__streamer_start_ts)
+        if delay > 0:
+            get_logger(0).info("Streamer is still starting up, waiting %.2f seconds before stopping ...", delay)
+            await asyncio.sleep(delay)
+
+    async def __kill_streamer_proc(self, *, graceful: bool=False) -> None:
         if self.__streamer_proc:
-            # 等待时间缩短至 1s：ustreamer 响应 SIGTERM 很快，超时则 SIGKILL
-            await aioproc.kill_process(self.__streamer_proc, 1, get_logger(0))
+            await self.__wait_streamer_settled()
+            if graceful:
+                # Used for WebRTC switching: a clean exit lets the streamer release
+                # the capture device properly, so don't make this an immediate SIGKILL.
+                # But never wait forever -- a streamer that fails to act on SIGTERM
+                # would block the whole stream controller, leaving mode switching dead.
+                logger = get_logger(0)
+                self.__streamer_proc.terminate()
+                try:
+                    await asyncio.wait_for(self.__streamer_proc.wait(), self.__GRACEFUL_STOP_TIMEOUT)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Streamer ignored SIGTERM for %.1f seconds, forcing ...",
+                        self.__GRACEFUL_STOP_TIMEOUT,
+                    )
+                    await aioproc.kill_process(self.__streamer_proc, 3, logger)
+            else:
+                await aioproc.kill_process(self.__streamer_proc, 3, get_logger(0))
         self.__streamer_proc = None

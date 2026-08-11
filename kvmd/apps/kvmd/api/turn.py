@@ -41,6 +41,12 @@ logger = get_logger()
 
 class TurnApi:
     _turn_file_path = "/tmp/turnserver.json"
+    _default_turn_data = {
+        "username": "",
+        "password": "",
+        "ttl": 86400,
+        "uris": [],
+    }
     __need_update = False
     
     def __init__(self) -> None:
@@ -80,7 +86,7 @@ class TurnApi:
 
     async def get_state(self) -> dict:
         """获取当前状态"""
-        return self._read_turn_file() or {}
+        return self._read_turn_file() or dict(self._default_turn_data)
 
     async def _inotify_watcher(self) -> AsyncGenerator[dict, None]:
         """使用 inotify 监听文件变化"""
@@ -174,10 +180,8 @@ class TurnApi:
     async def _get_turn_handler(self, _: Request) -> Response:
         """获取 turnserver.json 文件内容的 API"""
         if not os.path.exists(self._turn_file_path):
-            return make_json_exception(
-                BadRequestError("turnserver.json file not found"), 404
-            )
-        
+            return make_json_response(dict(self._default_turn_data))
+
         turn_data = self._read_turn_file()
         if turn_data is None:
             return make_json_exception(

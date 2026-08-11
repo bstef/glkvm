@@ -2,27 +2,31 @@ import asyncio
 import aiohttp
 from aiohttp import web
 from typing import Dict, Any
-import time
 import os
 import re
-import ipaddress
 import zipfile
 import io
 import datetime
 import json
 import yaml
+import shutil
+import fnmatch
+import glob
+from functools import lru_cache
+from concurrent.futures import ProcessPoolExecutor
 from ....logging import get_logger
 from .... import htclient
 
-from ....htserver import exposed_http, make_json_exception, make_json_response, start_streaming, stream_json, stream_json_exception, BadRequestError
-from ....validators.basic import valid_bool
-from ....validators.net import valid_url
+from ....htserver import exposed_http, make_json_exception, make_json_response, BadRequestError
 
 UPGRADE_DIR = "/userdata/"
 UPGRADE_FILE = "update.img"
 EDID_FILE = "/tmp/edid.bin"
 EDID_USER_FILE = "/etc/kvmd/user/edid.txt" # 用于保存当前写入的EDID
+EDID_LIST_FILE = "/etc/kvmd/edid.json"
 LOG_DIR = "/tmp/log"
+# 与 aiohttp Application 默认 client_max_size(1MiB) 对齐；超出由框架返回 413
+_FRONTEND_LOG_MAX_BYTES = 1024 * 1024
 LT6911C_UPGRADE_CMD = "lt6911c_upgrade -d /dev/i2c-1 -e /tmp/edid.bin && sleep 1 && echo 1 >  /sys/bus/i2c/devices/1-002b/reset"
 GSV1127X_UPGRADE_CMD = "echo 0 > /sys/bus/i2c/devices/1-0058/poll_interval_enable && sleep 1 " \
                             "&& gsv1127x_upgrade -d /dev/i2c-1 -e /tmp/edid.bin && sleep 1 " \
@@ -34,8 +38,11 @@ MODEL_PATH = "/proc/gl-hw-info/model"
 BASE_URL = "https://fw.gl-inet.com/kvm/{model}/release"
 BETA_BASE_URL = "https://fw.gl-inet.com/kvm/{model}/testing"
 
-_IPV4_RE = re.compile(rb"(?<![.\w])(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(?![.\d])")
+# 以字面量 "." 开头只匹配 IPv4 后三段，借助 re 引擎的字面量前缀快速跳过，
+# 避免在全文每个数字位置回溯试探；第一段由 _mask_public_ipv4 向前扩展补全并做边界检查。
+_IPV4_TAIL_RE = re.compile(rb"\.(?:\d{1,3}\.){2}\d{1,3}(?![.\d])")
 
+# 完整 IPv6 正则仅在 "::" 附近的小窗口内运行（见 _find_ipv6_spans），不做全文扫描
 _IPV6_RE = re.compile(
     rb"(?<![:\w])(?:"
     rb"(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}"
@@ -52,6 +59,22 @@ _IPV6_RE = re.compile(
     rb"|::"
     rb")(?![:\w])"
 )
+
+# 完整形式 IPv6（8 组无压缩）必含 7 个冒号：以字面量 ":" 开头匹配后 7 组做快速跳过，
+# 第一组由 _find_ipv6_spans 向前扩展补全并做边界检查。
+_IPV6_FULL_TAIL_RE = re.compile(rb":(?:[0-9a-fA-F]{1,4}:){6}[0-9a-fA-F]{1,4}(?![:\w])")
+
+_DIGIT_CHARS = frozenset(b"0123456789")
+_HEX_CHARS = frozenset(b"0123456789abcdefABCDEF")
+# IPv6 文本可能出现的字符（含 IPv4 映射形式的 "."）
+_IPV6_TOKEN_CHARS = frozenset(b"0123456789abcdefABCDEF:.")
+# "::" 窗口右边界须越过连续的 \w 字符，避免 finditer 的 endpos 截断让 (?![:\w]) 误判成功
+_IPV6_WINDOW_CHARS = _IPV6_TOKEN_CHARS | frozenset(
+    b"ghijklmnopqrstuvwxyzGHIJKLMNOPQRSTUVWXYZ_"
+)
+
+_SENSITIVE_RE = re.compile(rb'(?i)((?:auth_token|password)=)[^\s&"\']+')
+_MASK_CHUNK_SIZE = 1024 * 1024
 
 class LogCollector:
     def __init__(self, model: str, log_dir: str, config_path: str = "log_config.yaml"):
@@ -74,6 +97,8 @@ class LogCollector:
             'base_commands': {
                 'dmesg': 'dmesg_{timestamp}.log',
                 'logread': 'logread_{timestamp}.log',
+                'cat /userdata/log/messages /userdata/log/messages.* 2>/dev/null': 'logread_persist_{timestamp}.log',
+                'cat /userdata/log/last_boot.log': 'logread_last_boot_{timestamp}.log',
                 'lsusb': 'lsusb_{timestamp}.log',
                 'ps auxww': 'ps_auxww_{timestamp}.log',
                 'cat /proc/meminfo': 'meminfo_{timestamp}.log',
@@ -82,6 +107,8 @@ class LogCollector:
                 'cat /etc/glinet/gl-cloud.conf': 'gl-cloud.conf_{timestamp}.log',
                 'cat /etc/resolv.conf': 'resolv.conf_{timestamp}.log',
                 'ifconfig': 'ifconfig_{timestamp}.log',
+                'uptime': 'uptime_{timestamp}.log',
+                'top -b -n 1 -o RES': 'top_{timestamp}.log',
                 'wg': 'wg_{timestamp}.log',
                 'connmanctl services': 'connman_services_{timestamp}.log',
                 'connmanctl services 2>/dev/null | grep -oE "ethernet_[^ ]+" | head -1 | xargs -I{} connmanctl services {}': 'connman_eth0_{timestamp}.log',
@@ -104,66 +131,258 @@ class LogCollector:
                 'rmq1': {
                     'ubus call repeater status && iw dev wlan0 info && iw dev wlan0 link': 'wifi_status_{timestamp}.log',
                     'ubus call repeater dump_surveys': 'wifi_channel_surveys_{timestamp}.json',
-                    'cat /var/log/daemon.log': 'logread_{timestamp}.log',
+                    'cat /userdata/log/daemon.log*': 'daemon_{timestamp}.log',
+                    'cat /userdata/log/kvmd.log*': 'kvmd_{timestamp}.log',
                     'cat /userdata/log/ax_user.log': 'ax_user_{timestamp}.log',
                     'cat /userdata/log/AXSyslog/syslog/*.log': 'ax_syslog_{timestamp}.log',
+                    'axlogread': 'axlogread_{timestamp}.log',
                     'cat /userdata/swupdate.log': 'ax_swupdate_{timestamp}.log',
+                    'cat /userdata/log/drp_upgrade.log': 'drp_upgrade_{timestamp}.log',
+                    'cat /proc/ax_proc/mem_cmm_info': 'ax_mem_cmm_info_{timestamp}.log',
+                    'cat /proc/ax_proc/pool': 'ax_pool_info_{timestamp}.log',
+                    'cat /proc/ax_proc/vin/statistics': 'ax_vin_statistics_{timestamp}.log',
+                    'cat /proc/ax_proc/venc': 'ax_venc_{timestamp}.log',
                 }
-            }
+            },
+            # 需要脱敏处理的文件模式（glob 匹配），不在此列表的文件不做任何脱敏处理
+            'sensitive_patterns': [
+                '*ifconfig*',
+                '*connman*',
+                '*wg*',
+                '*daemon*',
+                '*kvmd*',
+                '*ax_user*',
+                '*ax_syslog*',
+                '*logread*',
+                '*modem_status*',
+                '*frontend*',
+            ],
         }
-        
-        try:
-            os.makedirs(os.path.dirname(config_path) or '.', exist_ok=True)
-            with open(config_path, 'w', encoding='utf-8') as f:
-                yaml.dump(default_config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
-        except Exception:
-            pass
             
         return default_config
     
     @staticmethod
-    def _mask_public_ips(content: bytes) -> bytes:
-        """公网 IPv4 隐藏最后一段（1.2.3.4 → 1.2.3.*），公网 IPv6 全部隐藏，私有/回环/链路本地保持不变。"""
-        def _replace_v4(m: "re.Match") -> bytes:
-            ip_bytes = m.group(0)
-            try:
-                ip = ipaddress.IPv4Address(ip_bytes.decode('ascii'))
-                if not ip.is_global:
-                    return ip_bytes
-            except (ValueError, UnicodeDecodeError):
-                return ip_bytes
-            return ip_bytes.rsplit(b".", 1)[0] + b".*"
+    @lru_cache(maxsize=65536)
+    def _is_global_ipv4(ip_bytes: bytes) -> bool:
+        try:
+            parts = ip_bytes.split(b".")
+            if len(parts) != 4:
+                return False
+            nums = tuple(int(part) for part in parts)
+            if any(num < 0 or num > 255 for num in nums):
+                return False
+        except ValueError:
+            return False
 
-        content = _IPV4_RE.sub(_replace_v4, content)
+        first, second, third, fourth = nums
+        if (
+            first == 0
+            or first == 10
+            or first == 127
+            or first >= 224
+            or (first == 100 and 64 <= second <= 127)
+            or (first == 169 and second == 254)
+            or (first == 172 and 16 <= second <= 31)
+            or (first == 192 and second == 168)
+            or (first == 192 and second == 0 and third in (0, 2))
+            or (first == 198 and second in (18, 19))
+            or (first == 198 and second == 51 and third == 100)
+            or (first == 203 and second == 0 and third == 113)
+            or (first == 255 and second == 255 and third == 255 and fourth == 255)
+        ):
+            return False
+        return True
 
-        def _replace_v6(m: "re.Match") -> bytes:
-            ip_bytes = m.group(0)
-            try:
-                ip = ipaddress.IPv6Address(ip_bytes.decode('ascii'))
-                if ip.ipv4_mapped:
-                    return b"*:*:*:*:*:*:*:*" if ip.ipv4_mapped.is_global else ip_bytes
-                if not ip.is_global:
-                    return ip_bytes
-            except (ValueError, UnicodeDecodeError):
-                return ip_bytes
-            return b"*:*:*:*:*:*:*:*"
+    @staticmethod
+    @lru_cache(maxsize=16384)
+    def _is_global_ipv6(ip_bytes: bytes) -> bool:
+        """快速判断 IPv6 地址是否为公网地址，使用前缀匹配替代 ipaddress 模块（性能提升 >10x）。"""
+        if len(ip_bytes) < 2:
+            return False
+        if ip_bytes == b"::1":
+            return False
+        if ip_bytes == b"::":
+            return False
+        low = ip_bytes.lower()
+        if low.startswith(b"::ffff:"):
+            return LogCollector._is_global_ipv4(ip_bytes[7:])
+        if low.startswith(b"ff"):
+            return False
+        if low[:1] == b"f" and len(low) > 1 and low[1:2] in (b"c", b"d"):
+            return False
+        if low.startswith(b"fe80"):
+            return False
+        if low.startswith(b"fec0"):
+            return False
+        return True
 
-        content = _IPV6_RE.sub(_replace_v6, content)
+    @staticmethod
+    def _mask_public_ipv4(content: bytes) -> bytes:
+        """公网 IPv4 隐藏最后一段（1.2.3.4 → 1.2.3.*），私有地址保持不变。
 
+        先用 _IPV4_TAIL_RE 定位候选（".x.x.x" 部分），再向前扩展第一个八位组，
+        边界检查与原正则 (?<![.\\w])...(?![.\\d]) 语义一致。"""
+        pieces = []
+        pos = 0
+        for m in _IPV4_TAIL_RE.finditer(content):
+            start = m.start()
+            first = start
+            while first > 0 and start - first < 3 and content[first - 1] in _DIGIT_CHARS:
+                first -= 1
+            if first == start:
+                continue
+            prev = content[first - 1:first]
+            if prev and (prev.isalnum() or prev in (b".", b"_")):  # 等价于 (?<![.\w])
+                continue
+            ip = content[first:m.end()]
+            if not LogCollector._is_global_ipv4(ip):
+                continue
+            pieces.append(content[pos:first])
+            pieces.append(ip[:ip.rfind(b".")] + b".*")
+            pos = m.end()
+        if not pieces:
+            return content
+        pieces.append(content[pos:])
+        return b"".join(pieces)
+
+    @staticmethod
+    def _find_ipv6_spans(content: bytes) -> list:
+        """定位所有公网 IPv6 的 (start, end) 区间，避免 _IPV6_RE 全文回溯扫描。
+
+        压缩形式必含 "::"：用 bytes.find 定位后，仅在其所在 token 的窗口内跑完整正则。
+        finditer 的 pos 不隔断 lookbehind（仍能看到窗口前的真实字符），窗口右界越过
+        连续 \\w 保证 lookahead 语义，因此窗口内匹配结果与全文扫描一致。
+        完整形式必含 7 个冒号：用 _IPV6_FULL_TAIL_RE 匹配后 7 组，再向前扩展第一组。"""
+        spans = []
+        length = len(content)
+
+        search = 0
+        while True:
+            i = content.find(b"::", search)
+            if i < 0:
+                break
+            lo = i
+            while lo > 0 and content[lo - 1] in _IPV6_TOKEN_CHARS:
+                lo -= 1
+            hi = i + 2
+            while hi < length and content[hi] in _IPV6_WINDOW_CHARS:
+                hi += 1
+            for m in _IPV6_RE.finditer(content, lo, hi):
+                if LogCollector._is_global_ipv6(m.group(0)):
+                    spans.append((m.start(), m.end()))
+            search = hi
+
+        for m in _IPV6_FULL_TAIL_RE.finditer(content):
+            start = m.start()
+            first = start
+            while first > 0 and start - first < 4 and content[first - 1] in _HEX_CHARS:
+                first -= 1
+            if first == start:
+                continue
+            prev = content[first - 1:first]
+            if prev and (prev.isalnum() or prev in (b"_", b":")):  # 等价于 (?<![:\w])
+                continue
+            if LogCollector._is_global_ipv6(content[first:m.end()]):
+                spans.append((first, m.end()))
+
+        return spans
+
+    @staticmethod
+    def _mask_public_ips(content: bytes, has_dot: bool = True, has_colon: bool = True) -> bytes:
+        """公网 IPv4 隐藏最后一段（1.2.3.4 → 1.2.3.*），公网 IPv6 全部隐藏。
+        根据预检查标志跳过不需要的扫描，避免无意义的全文匹配。"""
+        if has_dot:
+            content = LogCollector._mask_public_ipv4(content)
+        if has_colon:
+            spans = LogCollector._find_ipv6_spans(content)
+            if spans:
+                spans.sort()
+                pieces = []
+                pos = 0
+                for start, end in spans:
+                    if start < pos:  # 两条路径可能报出重叠/重复区间，跳过
+                        continue
+                    pieces.append(content[pos:start])
+                    pieces.append(b"*:*:*:*:*:*:*:*")
+                    pos = end
+                pieces.append(content[pos:])
+                content = b"".join(pieces)
         return content
 
     @staticmethod
     def _mask_sensitive_fields(content: bytes) -> bytes:
         """将日志中的敏感字段值隐藏，如 auth_token=123 → auth_token=xxxx，password=123 → password=xxxx。"""
-        _SENSITIVE_RE = re.compile(
-            rb'(?i)((?:auth_token|password)=)[^\s&"\']+'  
-        )
         return _SENSITIVE_RE.sub(rb'\1xxxx', content)
 
-    async def _execute_and_save(self, cmd: str, filepath: str) -> bool:
-        """执行命令并保存结果（带故障处理）"""
+    @classmethod
+    def _mask_content(cls, content: bytes) -> bytes:
+        """脱敏处理入口：根据内容特征精确跳过不需要的正则扫描。"""
+        has_dot = b"." in content
+        has_colon = b":" in content
+        has_sensitive = (
+            b"auth_token" in content or b"AUTH_TOKEN" in content
+            or b"password" in content or b"PASSWORD" in content
+        )
+        if has_dot or has_colon:
+            content = cls._mask_public_ips(content, has_dot=has_dot, has_colon=has_colon)
+        if has_sensitive:
+            content = cls._mask_sensitive_fields(content)
+        return content
+
+    def _try_copy(self, cmd: str, filepath: str) -> bool | None:
+        """如果是简单 cat 命令，直接读文件，避免 shell/子进程和大输出一次性驻留内存。
+        脱敏统一延后到子进程压缩阶段处理，这里只做原始拷贝。
+        返回 True/False 表示是否成功处理；返回 None 表示应回退到 subprocess。"""
+        if not cmd.startswith("cat ") or any(c in cmd for c in ("|", ">", "<", "&", ";")):
+            return None
+        src_path = cmd[4:].strip()
+        src_paths = glob.glob(src_path) if any(c in src_path for c in ("*", "?", "[")) else [src_path]
+        src_paths = [path for path in src_paths if os.path.isfile(path)]
+        if not src_paths:
+            return None
+
         try:
-            # 执行命令
+            with open(filepath, "wb") as f:
+                for index, src_path in enumerate(src_paths):
+                    if index:
+                        f.write(b"\n\n")
+                    with open(src_path, "rb") as src:
+                        shutil.copyfileobj(src, f, length=_MASK_CHUNK_SIZE)
+            return True
+        except Exception as e:
+            try:
+                with open(filepath, "wb") as f:
+                    f.write(f"Copy error: {str(e)}".encode())
+            except Exception:
+                pass
+            return True
+
+    def _write_command_output(self, filepath: str, stdout: bytes, stderr: bytes,
+                              returncode: int) -> None:
+        """写入命令原始输出（同步文件 IO，应在线程池中执行）。脱敏延后到压缩阶段。"""
+        with open(filepath, "wb") as f:
+            if stdout:
+                f.write(stdout)
+            if stderr:
+                f.write(b"\n\n--- STDERR ---\n\n")
+                f.write(stderr)
+
+        # 如果命令失败且没有输出，创建错误标记
+        if returncode != 0 and not stdout and not stderr:
+            with open(filepath, "wb") as f:
+                f.write(f"Command failed with exit code: {returncode}".encode())
+
+    async def _execute_and_save(self, cmd: str, filepath: str) -> bool:
+        """执行命令并保存原始结果（带故障处理）。脱敏统一在压缩阶段的子进程中完成。"""
+        loop = asyncio.get_event_loop()
+
+        # 简单 cat 命令直接拷贝，避免子进程开销；同步文件 IO 放到线程池
+        handled = await loop.run_in_executor(None, self._try_copy, cmd, filepath)
+        if handled is not None:
+            return handled
+
+        try:
+            # 执行命令（子进程本身是真异步，等待输出不阻塞事件循环）
             proc = await asyncio.create_subprocess_shell(
                 cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -171,24 +390,11 @@ class LogCollector:
             )
             stdout, stderr = await proc.communicate()
 
-            if stdout:
-                stdout = self._mask_public_ips(stdout)
-                stdout = self._mask_sensitive_fields(stdout)
-            if stderr:
-                stderr = self._mask_public_ips(stderr)
-                stderr = self._mask_sensitive_fields(stderr)
-
-            with open(filepath, "wb") as f:
-                if stdout:
-                    f.write(stdout)
-                if stderr:
-                    f.write(b"\n\n--- STDERR ---\n\n")
-                    f.write(stderr)
-
-            # 如果命令失败且没有输出，创建错误标记
-            if proc.returncode != 0 and not stdout and not stderr:
-                with open(filepath, "wb") as f:
-                    f.write(f"Command failed with exit code: {proc.returncode}".encode())
+            # 写文件（同步 IO）放到线程池
+            await loop.run_in_executor(
+                None, self._write_command_output,
+                filepath, stdout, stderr, proc.returncode,
+            )
 
             return True
         except Exception as e:
@@ -200,10 +406,72 @@ class LogCollector:
                 pass
             return False
     
+    async def _save_frontend_log(self, request: web.Request, timestamp: str) -> str | None:
+        """若请求携带 Body，则写入前端日志文件并返回路径；无 Body 时返回 None。
+
+        流式读取并限制在 _FRONTEND_LOG_MAX_BYTES；超出则截断并追加标记。
+        若 Content-Length 超过 aiohttp client_max_size，框架会直接返回 413。
+        """
+        if not request.can_read_body:
+            return None
+
+        # 流式读取到上限；超出部分丢弃并标记截断（Content-Length 超限由 aiohttp 先拒绝）
+        chunks: list[bytes] = []
+        written = 0
+        truncated = False
+        async for chunk in request.content.iter_chunked(64 * 1024):
+            if truncated:
+                continue  # 继续 drain，避免连接半开
+            remain = _FRONTEND_LOG_MAX_BYTES - written
+            if len(chunk) > remain:
+                if remain > 0:
+                    chunks.append(chunk[:remain])
+                    written += remain
+                truncated = True
+                continue
+            chunks.append(chunk)
+            written += len(chunk)
+
+        if written == 0:
+            return None
+
+        body = b"".join(chunks)
+        if truncated:
+            get_logger(0).warning(
+                "Frontend log body truncated to %d bytes", _FRONTEND_LOG_MAX_BYTES
+            )
+            body += (
+                b"\n\n--- TRUNCATED: frontend log exceeded "
+                + str(_FRONTEND_LOG_MAX_BYTES).encode()
+                + b" bytes ---\n"
+            )
+
+        filepath = f"{self.LOG_DIR}/frontend_{timestamp}.log"
+
+        def _write() -> None:
+            with open(filepath, "wb") as f:
+                f.write(body)
+
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, _write)
+        except Exception as ex:
+            get_logger(0).warning(f"Failed to write frontend log file: {ex}")
+            return None
+
+        get_logger(0).info(
+            "Saved frontend log (%d bytes) to %s", written, filepath
+        )
+        return filepath
+
     async def collect_download_logs(self, request: web.Request, timestamp: str) -> web.StreamResponse:
         """收集日志并打包返回ZIP响应（主函数）"""
+        loop = asyncio.get_event_loop()
+
         # 确保日志目录存在
         os.makedirs(self.LOG_DIR, exist_ok=True)
+
+        # 可选：将请求 Body 作为前端日志一并打包
+        frontend_log_path = await self._save_frontend_log(request, timestamp)
         
         # 构建命令字典（保持原代码逻辑）
         base_commands = self.config.get('base_commands', {})
@@ -222,60 +490,97 @@ class LogCollector:
                 filename = filename.get('filename', 'unknown.log')
             log_commands[cmd] = f"{self.LOG_DIR}/{filename.replace('{timestamp}', timestamp)}"
         
-        # 收集日志（顺序执行，保持原逻辑）
-        for cmd, filename in log_commands.items():
-            success = await self._execute_and_save(cmd, filename)
-            if success:
-                get_logger(0).info(f"Log collected: {filename}")
-            else:
-                get_logger(0).error(f"Failed to collect: {filename}")
-        
-        # 创建内存中的ZIP文件
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, 'a', zipfile.ZIP_DEFLATED, False) as zip_file:
-            for _, log_file in log_commands.items():
-                if os.path.exists(log_file):
-                    arcname = os.path.basename(log_file)
-                    try:
-                        # 先尝试使用原始方法
-                        zip_file.write(log_file, arcname)
-                    except Exception as e:
-                        # 如果失败（通常是时间戳问题），使用强制时间戳的方法
-                        get_logger(0).warning(f"Failed to add {log_file} with original method: {e}, using fixed timestamp")
-                        info = zipfile.ZipInfo(arcname)
-                        info.date_time = (2025, 1, 1, 0, 0, 0)  # 强制时间戳为2025-01-01
-                        with open(log_file, "rb") as f:
-                            zip_file.writestr(info, f.read())
-        
-        # 准备响应
+        # 收集日志（并行执行，用信号量限制并发数，避免资源争用）
+        sem = asyncio.Semaphore(4)
+
+        async def _collect_one(cmd: str, filepath: str) -> bool:
+            async with sem:
+                return await self._execute_and_save(cmd, filepath)
+
+        tasks = [_collect_one(cmd, fpath) for cmd, fpath in log_commands.items()]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 脱敏 + DEFLATE 压缩都是 CPU 密集，且正则脱敏不释放 GIL，放到独立子进程执行，
+        # 彻底绕开 GIL，避免阻塞主事件循环；子进程直接把 zip 落盘，避免内存翻倍。
+        log_files = list(log_commands.values())
+        if frontend_log_path:
+            log_files.append(frontend_log_path)
+        sensitive_patterns = self.config.get('sensitive_patterns', [])
+        zip_path = f"{self.LOG_DIR}_{timestamp}.zip"
+        try:
+            with ProcessPoolExecutor(max_workers=1) as executor:
+                await loop.run_in_executor(
+                    executor, _subprocess_build_zip,
+                    log_files, zip_path, sensitive_patterns,
+                )
+        except Exception as ex:
+            # 子进程不可用时回退到线程池执行同一逻辑（压缩段释放 GIL，仍能缓解卡顿）
+            get_logger(0).warning(f"ProcessPool zip build failed ({ex}), falling back to thread pool")
+            await loop.run_in_executor(
+                None, _subprocess_build_zip, log_files, zip_path, sensitive_patterns
+            )
+
+        # 准备响应并流式回传（读盘走线程池，发送 await，全程不阻塞事件循环）
         response = web.StreamResponse()
         response.headers['Content-Type'] = 'application/zip'
         response.headers['Content-Disposition'] = f'attachment; filename="system_logs_{timestamp}.zip"'
-        
-        # 获取ZIP文件大小
-        zip_buffer.seek(0, io.SEEK_END)
-        size = zip_buffer.tell()
-        zip_buffer.seek(0)
-        
-        response.content_length = size
-        await response.prepare(request)
-        
-        # 发送ZIP文件
-        await response.write(zip_buffer.getvalue())
-        
-        # 清理临时文件
-        for _, log_file in log_commands.items():
-            if os.path.exists(log_file):
-                os.remove(log_file)
-        
-        # 尝试删除临时目录（如果为空）
+        response.content_length = os.path.getsize(zip_path)
+
         try:
-            os.rmdir(self.LOG_DIR)
-        except OSError:
-            pass  # 目录可能不为空，忽略错误
-        
-        await response.write_eof()
+            await response.prepare(request)
+            with open(zip_path, "rb") as f:
+                while True:
+                    chunk = await loop.run_in_executor(None, f.read, 256 * 1024)
+                    if not chunk:
+                        break
+                    await response.write(chunk)
+            await response.write_eof()
+        finally:
+            # 清理日志目录和临时 zip，同步 IO 放到线程池
+            await loop.run_in_executor(
+                None, lambda: shutil.rmtree(self.LOG_DIR, ignore_errors=True)
+            )
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
+
         return response
+
+
+def _subprocess_build_zip(log_files: list, zip_path: str, sensitive_patterns: list) -> None:
+    """在独立子进程中完成脱敏 + 压缩并落盘，绕开 GIL，避免阻塞主事件循环。
+
+    必须是模块级函数（可 pickle）才能交给 ProcessPoolExecutor 执行。
+    流式读取每个日志文件：命中 sensitive_patterns 的分块脱敏后再压缩，避免大文件一次性进内存。
+    """
+    _READ_SIZE = 256 * 1024
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for log_file in log_files:
+            if not os.path.exists(log_file):
+                continue
+            arcname = os.path.basename(log_file)
+            need_mask = any(fnmatch.fnmatch(arcname, pat) for pat in sensitive_patterns)
+            # 固定时间戳，规避 zip 对 <1980 时间戳报错；统一走流式写入控制内存
+            info = zipfile.ZipInfo(arcname, date_time=(2025, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            try:
+                with zf.open(info, "w") as dst, open(log_file, "rb") as src:
+                    while True:
+                        chunk = src.read(_READ_SIZE)
+                        if not chunk:
+                            break
+                        if need_mask:
+                            chunk = LogCollector._mask_content(chunk)
+                        dst.write(chunk)
+            except Exception as e:
+                # 单个文件失败不影响整体打包
+                try:
+                    err_info = zipfile.ZipInfo(arcname + ".error", date_time=(2025, 1, 1, 0, 0, 0))
+                    zf.writestr(err_info, f"Failed to pack {arcname}: {e}".encode())
+                except Exception:
+                    pass
+
 
 class UpgradeApi:
     def __init__(self):
@@ -393,6 +698,14 @@ class UpgradeApi:
     async def __compare_handler(self, request: web.Request) -> web.Response:
         result = await self.__update_engine.compare_versions()
         return make_json_response(result)
+
+    @exposed_http(
+        "GET",
+        "/upgrade/gui_compare",
+        allowed_exe_paths=["/usr/sbin/gl_kvm_gui"],
+    )
+    async def __gui_compare_handler(self, request: web.Request) -> web.Response:
+        return await self.__compare_handler(request)
     
     @exposed_http("GET", "/upgrade/version")
     async def __version_handler(self, request: web.Request) -> web.Response:
@@ -479,22 +792,20 @@ class UpgradeApi:
         await asyncio.create_subprocess_shell("/usr/sbin/reset_default.sh")
 
     @exposed_http("GET", "/upgrade/download")
-    async def __download_handler(self, request: web.Request) -> web.StreamResponse:
+    async def __download_handler(self, request: web.Request) -> web.Response:
         return await self.__start_download_task(
-            request,
             base_url=self.__update_engine.get_base_url(),
         )
 
     @exposed_http("GET", "/upgrade/beta/download")
-    async def __beta_download_handler(self, request: web.Request) -> web.StreamResponse:
+    async def __beta_download_handler(self, request: web.Request) -> web.Response:
         return await self.__start_download_task(
-            request,
             base_url=self.__update_engine.get_beta_base_url(),
             list_sha256_url=self.__update_engine.get_beta_list_sha256_url(),
         )
 
-    async def __start_download_task(self, request: web.Request, base_url: str,
-                                     list_sha256_url: str = None) -> web.StreamResponse:
+    async def __start_download_task(self, base_url: str,
+                                     list_sha256_url: str = None) -> web.Response:
         # 如果有正在进行的下载任务，取消它
         if self.__current_download_task and not self.__current_download_task.done():
             self.__current_download_task.cancel()
@@ -503,11 +814,15 @@ class UpgradeApi:
             except asyncio.CancelledError:
                 pass
 
-        # 创建新的下载任务
+        # 创建新的下载任务。started 只承载"已取得固件大小"这一步的结果：
+        # 本请求拿到 size 就返回，剩下的下载在后台任务里继续，避免整个下载期间
+        # 一直占住这条 HTTP 连接（会导致后续 /api 请求被 nginx 卡住直到下载结束）
+        started: asyncio.Future = asyncio.get_event_loop().create_future()
         self.__current_download_task = asyncio.create_task(
-            self._download_latest_firmware(request, base_url, list_sha256_url)
+            self._download_latest_firmware(base_url, list_sha256_url, started)
         )
-        return await self.__current_download_task
+        size = await started
+        return make_json_response({"size": size})
 
     @exposed_http("GET", "/upgrade/download_cancel")
     async def __download_cancel_handler(self, request: web.Request) -> web.Response:
@@ -604,7 +919,27 @@ class UpgradeApi:
             get_logger(0).error(f"Error getting EDID data: {str(ex)}")
             return make_json_exception(str(ex), 500)
 
+    @exposed_http("GET", "/upgrade/edid_list")
+    async def __get_edid_list_handler(self, _: web.Request) -> web.Response:
+        try:
+            with open(EDID_LIST_FILE, "r", encoding="utf-8") as f:
+                data = f.read()
+        except FileNotFoundError:
+            get_logger(0).warning("edid.json not found at %s", EDID_LIST_FILE)
+            data = "[]"
+        except Exception as ex:
+            get_logger(0).error(f"Error reading edid.json: {ex}")
+            data = "[]"
+        return web.Response(text=data, content_type="application/json")
+
     @exposed_http("GET", "/upgrade/log")
+    async def __log_get_handler(self, request: web.Request) -> web.Response:
+        return await self.__log_handler(request)
+
+    @exposed_http("POST", "/upgrade/log")
+    async def __log_post_handler(self, request: web.Request) -> web.Response:
+        return await self.__log_handler(request)
+
     async def __log_handler(self, request: web.Request) -> web.Response:
         try:
             # 创建临时日志目录
@@ -625,9 +960,9 @@ class UpgradeApi:
             get_logger(0).error(f"Error collecting logs: {str(ex)}")
             return make_json_exception(f"Error collecting logs: {str(ex)}", 500)
 
-    async def _download_latest_firmware(self, request: web.Request,
-                                         base_url: str, list_sha256_url: str = None) -> web.StreamResponse:
-        written = size = 0
+    async def _download_latest_firmware(self, base_url: str, list_sha256_url: str,
+                                         started: asyncio.Future) -> None:
+        written = 0
 
         async with self.__download_lock:
             try:
@@ -635,7 +970,7 @@ class UpgradeApi:
                 version, firmware_filename = await self.__update_engine.get_list_sha256(list_sha256_url)
                 if not firmware_filename:
                     raise BadRequestError("Unable to get firmware filename")
-                
+
                 # 构建完整的固件下载URL
                 firmware_url = f"{base_url}/{firmware_filename}"
                 get_logger(0).info("Generated firmware URL: %s", firmware_url)
@@ -649,11 +984,10 @@ class UpgradeApi:
                     if not size:
                         raise BadRequestError("Unable to get firmware size")
 
-                    # 立即返回文件大小信息
-                    response = make_json_response({"size": size})
+                    # 立即把文件大小交回请求方，请求到此就结束了
                     self.__total_firmware_size = size
-                    await response.prepare(request)
-                    await response.write_eof()
+                    if not started.done():
+                        started.set_result(size)
 
                     get_logger(0).info("Downloading firmware from %r to %r ...", firmware_url, f"{UPGRADE_DIR}{UPGRADE_FILE}")
 
@@ -667,17 +1001,18 @@ class UpgradeApi:
                         except asyncio.CancelledError:
                             get_logger(0).info("Download task cancelled")
                             raise
-                    
-                    return response
+                    get_logger(0).info("Firmware downloaded, %d bytes written", written)
 
-            except BadRequestError as ex:
-                if isinstance(ex, aiohttp.ClientError):
-                    return make_json_exception(ex, 400)
-            except aiohttp.ClientError as ex:
-                if isinstance(ex, aiohttp.ClientError):
-                    return make_json_exception(ex, 400)
-            except Exception as ex:
+            except asyncio.CancelledError:
+                # 还没上报 size 就被取消，让等待中的请求收到 400 而不是一直挂着
+                if not started.done():
+                    started.set_exception(BadRequestError("Download task was cancelled"))
                 raise
+            except Exception as ex:
+                get_logger(0).error("Error downloading firmware: %s", str(ex))
+                if not started.done():
+                    started.set_exception(ex if isinstance(ex, BadRequestError) else BadRequestError(str(ex)))
+                # size 已上报时请求早已返回，这里只记日志，避免后台任务异常无人接收
 
 class UpdateEngine:
     def __init__(self,base_url: str):

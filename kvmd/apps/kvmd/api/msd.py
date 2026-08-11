@@ -50,6 +50,8 @@ from ....htserver import stream_json_exception
 from ....plugins.msd import BaseMsd
 from ....plugins.msd import MsdNoSpaceError
 
+from ....htserver import BadRequestError
+
 from ....validators import check_string_in_list
 from ....validators.basic import valid_bool
 from ....validators.basic import valid_int_f0
@@ -144,6 +146,15 @@ class MsdApi:
             except Exception as e:
                 get_logger(0).error(f"reset UDC: {e}")
         return make_json_response()
+
+    @exposed_http("POST", "/msd/switch_partition")
+    async def __switch_partition_handler(self, req: Request) -> Response:
+        # 不重启切换 MSD 后端分区, 并把变更落到 boot.yaml
+        device = req.query.get("device", "").strip()
+        if not device:
+            raise BadRequestError("device parameter is required")
+        info = await self.__msd.switch_partition(device)
+        return make_json_response(info)
 
     @exposed_http("GET", "/msd/partition_format")
     async def __format_partition_handler(self, req: Request) -> Response:

@@ -59,18 +59,18 @@ class Chain:
     # Active port control
     # ------------------------------------------------------------------
 
-    def set_active_prev(self) -> None:
+    async def set_active_prev(self) -> None:
         if self.__active_port > 0:
-            self.set_active_port(self.__active_port - 1)
+            await self.set_active_port(self.__active_port - 1)
 
-    def set_active_next(self) -> None:
+    async def set_active_next(self) -> None:
         if self.__active_port < self.CHANNEL_COUNT - 1:
-            self.set_active_port(self.__active_port + 1)
+            await self.set_active_port(self.__active_port + 1)
 
-    def set_active_port(self, port: int) -> None:
+    async def set_active_port(self, port: int) -> None:
         if not (0 <= port < self.CHANNEL_COUNT):
             return
-        self.__device.request_switch(0, port)
+        await self.__device.async_request_switch(0, port)
         self.__active_port = port
 
     def get_current_channel(self) -> int:

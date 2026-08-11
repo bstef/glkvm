@@ -155,11 +155,15 @@ class BaseHid(BasePlugin):  # pylint: disable=too-many-instance-attributes
         no_ignore_keys: bool=False,
         slow: bool=False,
     ) -> None:
+    
+        # Typical USB HID polling interval is 8-10ms; we use 5ms as the
+        # minimum to stay safely within the endpoint throughput while keeping
+        # paste speed reasonable.
+        delay = 0.03 if slow else 0.005
 
         for (key, state) in keys:
             if no_ignore_keys or key not in self.__ignore_keys:
-                if slow:
-                    await asyncio.sleep(0.02)
+                await asyncio.sleep(delay)
                 self.send_key_event(key, state, False)
 
     def send_key_event(self, key: int, state: bool, finish: bool) -> None:
@@ -225,6 +229,17 @@ class BaseHid(BasePlugin):  # pylint: disable=too-many-instance-attributes
 
     # =====
 
+    def send_touch_event(self, to_x: int, to_y: int, touching: bool) -> None:
+        self._send_touch_event(to_x, to_y, touching)
+        self.__bump_activity()
+
+    def _send_touch_event(self, to_x: int, to_y: int, touching: bool) -> None:
+        _ = to_x
+        _ = to_y
+        _ = touching
+
+    # =====
+
     def clear_events(self) -> None:
         self._clear_events()  # Don't bump activity here
 
@@ -286,6 +301,9 @@ class BaseHid(BasePlugin):  # pylint: disable=too-many-instance-attributes
                 "schedule": list(self.__j_schedule),
             },
         }
+
+    def set_jiggler_interval(self, interval: int) -> None:
+        self.__j_interval = interval
 
     def set_jiggler_schedule(self, periods: list[dict]) -> None:
         self.__j_schedule = list(periods)

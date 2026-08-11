@@ -134,17 +134,17 @@ def init(
     )
     # 添加配置文件路径参数
     parser.add_argument("-c", "--config", default="/etc/kvmd/main.yaml", type=valid_abs_file,
-                        help="设置配置文件路径", metavar="<file>")
+                        help="Set config file path", metavar="<file>")
     # 添加覆盖配置选项参数
     parser.add_argument("-o", "--set-options", default=[], nargs="+",
-                        help="覆盖配置选项列表（格式如 sec/sub/opt=value）", metavar="<k=v>",)
+                        help="Override config options list (format: sec/sub/opt=value)", metavar="<k=v>",)
     # 添加查看当前配置参数
     parser.add_argument("-m", "--dump-config", action="store_true",
-                        help="查看当前配置（包括所有覆盖）")
+                        help="Dump current config (including all overrides)")
     # 如果需要检查运行，添加运行服务参数
     if check_run:
         parser.add_argument("--run", dest="run", action="store_true",
-                            help="运行服务")
+                            help="Run service")
     # 解析命令行参数
     (options, remaining) = parser.parse_known_args(argv)
 
@@ -175,9 +175,9 @@ def init(
     # 如果需要检查运行但未指定--run选项，则退出并提示
     if check_run and not options.run:
         raise SystemExit(
-            "为防止意外启动，您必须指定 --run 选项来启动。\n"
-            "尝试使用 --help 选项来了解此服务的功能。\n"
-            "请确保您完全理解您正在做什么！"
+            "To prevent accidental startup, you must specify the --run option to start.\n"
+            "Try the --help option to learn what this service does.\n"
+            "Please make sure you fully understand what you are doing!"
         )
 
     # 返回解析器、剩余参数和配置
@@ -193,10 +193,10 @@ def _init_config(config_path: str, override_options: list[str], **load_flags: bo
         raw_config: dict = load_yaml_file(config_path)
     except Exception as ex:
         # 如果无法读取配置文件，抛出异常
-        raise SystemExit(f"ConfigError: 无法读取配置文件 {config_path!r}:\n{tools.efmt(ex)}")
+        raise SystemExit(f"ConfigError: Cannot read config file {config_path!r}:\n{tools.efmt(ex)}")
     if not isinstance(raw_config, dict):
         # 确保配置文件的顶层是字典类型
-        raise SystemExit(f"ConfigError: 文件 {config_path!r} 的顶层必须是字典")
+        raise SystemExit(f"ConfigError: The top level of file {config_path!r} must be a dict")
 
     # 获取配置方案
     scheme = _get_config_scheme()
@@ -406,7 +406,14 @@ def _get_config_scheme() -> dict:
                 default_product_id = int(pid_str, 0)  # 自动检测进制
     except:
         default_product_id = 0x0104  # 默认值
-    
+        
+    # 读取 USB 端点数量，如果文件不存在则使用默认值 9
+    try:
+        with open("/proc/gl-hw-info/capability/usb_epin", "r") as f:
+            default_endpoints = int(f.read().strip())
+    except:
+        default_endpoints = 9  # 默认值
+
     return {
         "logging": Option({}),
 
@@ -463,8 +470,7 @@ def _get_config_scheme() -> dict:
                 "extras": Option("/usr/share/kvmd/extras", type=valid_abs_dir),
                 "hw": {
                     "platform":      Option("/usr/share/kvmd/platform", type=valid_abs_file, unpack_as="platform_path"),
-                    # "vcgencmd_cmd":  Option(["/usr/bin/vcgencmd"], type=valid_command),
-                    "ignore_past":   Option(False, type=valid_bool),
+                    # 采集间隔 5s：网络流量速率按相邻两次采样差值 / 时间间隔计算（B/s），间隔变长仍正确
                     "state_poll":    Option(5.0,   type=valid_float_f01),
                 },
                 "fan": {
@@ -477,6 +483,9 @@ def _get_config_scheme() -> dict:
 
             "log_reader": {
                 "enabled": Option(True, type=valid_bool),
+                "path": Option("/var/log/kvmd.log", type=valid_abs_path),
+                "max_bytes": Option(512 * 1024, type=valid_int_f1),
+                "backup_count": Option(2, type=valid_int_f0),
             },
 
             "prometheus": {
@@ -653,13 +662,13 @@ def _get_config_scheme() -> dict:
             "config":         Option("",     type=valid_stripped_string),
             "device_version": Option(-1,     type=functools.partial(valid_number, min=-1, max=0xFFFF)),
             "usb_version":    Option(0x0200, type=valid_otg_id),
-            "max_power":      Option(250,    type=functools.partial(valid_number, min=50, max=500)),
+            "max_power":      Option(500,    type=functools.partial(valid_number, min=50, max=500)),
             "remote_wakeup":  Option(True,  type=valid_bool),
 
             "gadget":     Option("rockchip", type=valid_otg_gadget),
             "config":     Option("Glinet device", type=valid_stripped_string_not_empty),
             "udc":        Option("",     type=valid_stripped_string),
-            "endpoints":  Option(9,      type=valid_int_f0),
+            "endpoints":  Option(default_endpoints, type=valid_int_f0),
             "init_delay": Option(3.0,    type=valid_float_f01),
 
             "user": Option("root", type=valid_user),
@@ -679,6 +688,10 @@ def _get_config_scheme() -> dict:
                         "enabled": Option(True, type=valid_bool),
                         "start": Option(True, type=valid_bool),
                         "device": Option("/dev/hidg2", type=valid_abs_path),
+                    },
+                    "touch": {
+                        "enabled": Option(True, type=valid_bool),
+                        "start": Option(False, type=valid_bool),
                     },
                 },
 
@@ -724,10 +737,21 @@ def _get_config_scheme() -> dict:
                     "start":   Option(False,  type=valid_bool),
                 },
 
+                "mtp": {
+                    "enabled": Option(True,  type=valid_bool),
+                    "start":   Option(False, type=valid_bool),
+                },
+
                 "audio": {
                     "enabled":  Option(True, type=valid_bool),
                     "start":    Option(False,  type=valid_bool),
                     "product":  Option("Comet Microphone", type=valid_stripped_string),
+                },
+                
+                "camera": {
+                    "enabled":  Option(model != "rmq1", type=valid_bool),
+                    "start":    Option(False, type=valid_bool),
+                    "product":  Option("UVC Camera", type=valid_stripped_string),
                 },
 
                 "drives": {

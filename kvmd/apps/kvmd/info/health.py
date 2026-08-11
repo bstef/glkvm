@@ -22,53 +22,45 @@
 
 import asyncio
 import copy
+import time
 
-from typing import Callable
 from typing import AsyncGenerator
-from typing import TypeVar
 
 import psutil
 
 from ....logging import get_logger
 
 from .... import env
-from .... import tools
 from .... import aiotools
-from .... import aioproc
 
 from .base import BaseInfoSubmanager
-
-
-# =====
-_RetvalT = TypeVar("_RetvalT")
 
 
 # =====
 class HealthInfoSubmanager(BaseInfoSubmanager):
     def __init__(
         self,
-        vcgencmd_cmd: list[str],
-        ignore_past: bool,
         state_poll: float,
     ) -> None:
 
-        self.__vcgencmd_cmd = vcgencmd_cmd
-        self.__ignore_past = ignore_past
         self.__state_poll = state_poll
 
         self.__notifier = aiotools.AioNotifier()
 
+        # 网络流量速率计算需要保存上一次的累计计数与采样时刻
+        self.__prev_net: (tuple[float, int, int] | None) = None
+
     async def get_state(self) -> dict:
         (
-            throttling,
             cpu_percent,
             cpu_temp,
             mem,
+            net,
         ) = await asyncio.gather(
-            self.__get_throttling(),
             self.__get_cpu_percent(),
             self.__get_cpu_temp(),
             self.__get_mem(),
+            self.__get_net(),
         )
         return {
             "temp": {
@@ -78,7 +70,10 @@ class HealthInfoSubmanager(BaseInfoSubmanager):
                 "percent": cpu_percent,
             },
             "mem": mem,
-            "throttling": throttling,
+            "net": net,
+            # throttling 依赖树莓派专属的 vcgencmd，本机型（RV1126）不存在，
+            # 始终为 None。前端 info.js / export.py 已对 null 做兼容处理。
+            "throttling": None,
         }
 
     async def trigger_state(self) -> None:
@@ -139,42 +134,37 @@ class HealthInfoSubmanager(BaseInfoSubmanager):
                 "available": None,
             }
 
-    async def __get_throttling(self) -> (dict | None):
-        # https://www.raspberrypi.org/forums/viewtopic.php?f=63&t=147781&start=50#p972790
-        flags = await self.__parse_vcgencmd(
-            arg="get_throttled",
-            parser=(lambda text: int(text.split("=")[-1].strip(), 16)),
-        )
-        if flags is not None:
-            return {
-                "raw_flags": flags,
-                "parsed_flags": {
-                    "undervoltage": {
-                        "now": bool(flags & (1 << 0)),
-                        "past": bool(flags & (1 << 16)),
-                    },
-                    "freq_capped": {
-                        "now": bool(flags & (1 << 1)),
-                        "past": bool(flags & (1 << 17)),
-                    },
-                    "throttled": {
-                        "now": bool(flags & (1 << 2)),
-                        "past": bool(flags & (1 << 18)),
-                    },
-                },
-                "ignore_past": self.__ignore_past,
-            }
-        return None
+    async def __get_net(self) -> dict:
+        # 网络流量：psutil 返回累计字节数，需用两次采样的差值除以时间间隔得到速率（B/s）。
+        # 排除 lo 回环接口，统计所有物理网卡之和。
+        try:
+            counters = psutil.net_io_counters(pernic=True)
+            bytes_sent = sum(c.bytes_sent for (nic, c) in counters.items() if nic != "lo")
+            bytes_recv = sum(c.bytes_recv for (nic, c) in counters.items() if nic != "lo")
+            now = time.monotonic()
 
-    async def __parse_vcgencmd(self, arg: str, parser: Callable[[str], _RetvalT]) -> (_RetvalT | None):
-        cmd = [*self.__vcgencmd_cmd, arg]
-        try:
-            text = (await aioproc.read_process(cmd, err_to_null=True))[1]
-        except Exception:
-            get_logger(0).exception("Error while executing: %s", tools.cmdfmt(cmd))
-            return None
-        try:
-            return parser(text)
+            tx_rate = 0
+            rx_rate = 0
+            if self.__prev_net is not None:
+                (prev_ts, prev_sent, prev_recv) = self.__prev_net
+                dt = now - prev_ts
+                if dt > 0:
+                    # max(0, ...) 防止网卡计数器回绕/重置导致负值
+                    tx_rate = int(max(0, bytes_sent - prev_sent) / dt)
+                    rx_rate = int(max(0, bytes_recv - prev_recv) / dt)
+            self.__prev_net = (now, bytes_sent, bytes_recv)
+
+            return {
+                "bytes_sent": bytes_sent,
+                "bytes_recv": bytes_recv,
+                "tx_rate": tx_rate,  # 上行速率 B/s
+                "rx_rate": rx_rate,  # 下行速率 B/s
+            }
         except Exception as ex:
-            get_logger(0).error("Can't parse [ %s ] output: %r: %s", tools.cmdfmt(cmd), text, tools.efmt(ex))
-            return None
+            get_logger(0).error("Can't get network IO: %s", ex)
+            return {
+                "bytes_sent": None,
+                "bytes_recv": None,
+                "tx_rate": None,
+                "rx_rate": None,
+            }

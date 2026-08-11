@@ -114,7 +114,7 @@ class ExtrasInfoSubmanager(BaseInfoSubmanager):
                     # print("============================")
                 except Exception as ex:
                     # 如果获取状态失败,记录错误日志
-                    get_logger(0).error("无法获取服务 %r 的信息: %s", daemon, tools.efmt(ex))
+                    get_logger(0).error("Failed to get info for service %r: %s", daemon, tools.efmt(ex))
             else:
                 # 强制配置为enable started, 暂时禁止ipmi 和 vnc
                 if "vnc" in daemon or "ipmi" in daemon:

@@ -23,6 +23,10 @@
 import sys
 import types
 
+try:
+    import user_agents as _user_agents
+except ImportError:
+    _user_agents = None  # type: ignore
 
 
 MODEL_PATH = "/proc/gl-hw-info/model"
@@ -44,19 +48,20 @@ def parse_user_agent(ua_string: str) -> tuple[str, str]:
     """解析 User-Agent 字符串，返回 (device_type, browser)。
 
     device_type: "Mobile" | "Tablet" | "PC" | "Unknown"
-    browser:     浏览器名称，如 "Chrome"、"Safari"，解析失败时为 "Unknown"
+    browser:     浏览器名称，如 "Chrome"、"Safari"；命中自定义 App UA 时为匹配的 marker；
+                 解析失败时为 "Unknown"
     """
-    if ua_string in _MOBILE_APP_UA:
-        return ("Mobile", ua_string)
-    if ua_string in _DESKTOP_APP_UA:
-        return ("PC", ua_string)
+    for marker in _MOBILE_APP_UA:
+        if marker in ua_string:
+            return ("Mobile", marker)
+    for marker in _DESKTOP_APP_UA:
+        if marker in ua_string:
+            return ("PC", marker)
 
-    try:
-        import user_agents  # pylint: disable=import-outside-toplevel
-    except ImportError:
+    if _user_agents is None:
         return ("Unknown", "Unknown")
 
-    ua = user_agents.parse(ua_string)
+    ua = _user_agents.parse(ua_string)
     if ua.is_mobile:
         device_type = "Mobile"
     elif ua.is_tablet:

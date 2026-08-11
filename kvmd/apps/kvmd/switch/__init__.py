@@ -22,6 +22,7 @@
 
 import os
 import asyncio
+import inspect
 
 from typing import AsyncGenerator
 
@@ -144,13 +145,18 @@ class Switch:  # pylint: disable=too-many-public-methods
     # =====
 
     async def set_active_prev(self) -> None:
-        self.__chain.set_active_prev()
+        await self.__maybe_await(self.__chain.set_active_prev())
 
     async def set_active_next(self) -> None:
-        self.__chain.set_active_next()
+        await self.__maybe_await(self.__chain.set_active_next())
 
     async def set_active_port(self, port: float) -> None:
-        self.__chain.set_active_port(self.__chain.translate_port(port))
+        await self.__maybe_await(self.__chain.set_active_port(self.__chain.translate_port(port)))
+
+    @staticmethod
+    async def __maybe_await(value) -> None:
+        if inspect.isawaitable(value):
+            await value
 
     # =====
 

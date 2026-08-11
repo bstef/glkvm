@@ -41,6 +41,10 @@ from .events import BaseEvent
 
 
 # =====
+_HID_SUSPEND_FILE = "/var/run/kvmd-hid-otg.suspend"
+
+
+# =====
 class BaseDeviceProcess(multiprocessing.Process):  # pylint: disable=too-many-instance-attributes
     def __init__(  # pylint: disable=too-many-arguments
         self,
@@ -176,11 +180,19 @@ class BaseDeviceProcess(multiprocessing.Process):  # pylint: disable=too-many-in
         """检查一个数是否是2的N次方"""
         return n > 0 and (n & (n - 1)) == 0
 
+    def __is_hid_suspended(self) -> bool:
+        return os.path.exists(_HID_SUSPEND_FILE)
+
     def __is_udc_configured(self) -> bool:
+        # 切换通道时候需要 udc unbind，这时候没有 /sys/class/udc/21500000.usb/state的
+        if not os.path.exists(self.__udc_state_path):
+            return False
         try:
             with open(self.__udc_state_path) as file:
                 return (file.read().strip().lower() == "configured")
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError):
+            # FileNotFoundError: UDC state file doesn't exist yet
+            # OSError (ENODEV etc.): UDC driver is resetting during gadget reconfiguration
             return False
 
     def __write_report(self, report: bytes) -> bool:
@@ -247,6 +259,11 @@ class BaseDeviceProcess(multiprocessing.Process):  # pylint: disable=too-many-in
             return True
 
         logger = self.__get_logger()
+
+        if self.__is_hid_suspended():
+            self.__close_device()
+            self.__state_flags.update(online=False)
+            return False
 
         if not os.path.exists(self.__device_path):
             # Во-первых, не пытаемся открыть устройство, если его нет.

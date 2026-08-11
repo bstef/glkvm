@@ -47,6 +47,7 @@ from .... import aiotools
 from .... import aiohelpers
 from .... import fstab
 
+from .. import MsdOperationError
 from .. import MsdIsBusyError
 from .. import MsdOfflineError
 from .. import MsdConnectedError
@@ -133,12 +134,18 @@ class Plugin(BaseMsd):  # pylint: disable=too-many-instance-attributes
             "/dev/mtdblock10": "/userdata/media",
             "/dev/block/by-name/media": "/userdata/media",
         }
+        # rmq1 使用 mtdblock，没有 mmcblk eMMC
+        _emmc_base_dev: (str | None) = None
+        _media_part_name = "mtdblock10"
     else:
         mount_dict = {
             "/dev/mmcblk0p10": "/userdata/media",
             "/dev/block/by-name/media": "/userdata/media",
         }
-    
+        # 内置 eMMC 固定为 mmcblk0，TF 卡为 mmcblk1 及以上
+        _emmc_base_dev: (str | None) = "mmcblk0"
+        _media_part_name = "mmcblk0p10"
+
     def get_storage_root(self) -> str:
         return self.get_mount_path(self.__partition_device)
 
@@ -147,12 +154,27 @@ class Plugin(BaseMsd):  # pylint: disable=too-many-instance-attributes
         if device_path in self.mount_dict:
             return self.mount_dict[device_path]
 
-        # 如果设备路径匹配/dev/sdxx模式，返回/mnt/sdcard/
+        # 如果设备路径匹配/dev/sdxx模式，返回/mnt/sdcard/（USB U盘）
         if device_path.startswith("/dev/sd"):
+            return "/mnt/sdcard/"
+
+        # TF 卡分区：/dev/mmcblkNpM 且不在 mount_dict 中（已被上面排除 eMMC）
+        if re.match(r"/dev/mmcblk\d+p\d+$", device_path):
             return "/mnt/sdcard/"
 
         # 默认返回None
         return None
+
+    def __is_tf_card_device(self, base_dev: str) -> bool:
+        # 通过 sysfs 判断 mmcblk 设备是否为 TF/SD 卡（device/type 返回 "SD"）
+        # eMMC 的 type 为 "MMC"，SD/TF 卡为 "SD"
+        # 无法读取 sysfs 时保守地返回 False，避免误判 eMMC 分区
+        type_path = f"/sys/block/{base_dev}/device/type"
+        try:
+            with open(type_path, "r") as f:
+                return f.read().strip().upper() == "SD"
+        except (IOError, OSError):
+            return False
 
     def __notify_remount(self) -> None:
         # 通知systask重新初始化inotify监听器，用于处理分区重新挂载的情况
@@ -212,6 +234,7 @@ class Plugin(BaseMsd):  # pylint: disable=too-many-instance-attributes
         # 直接用固定值,或者 TODO:后面增加一个main/override配置
         # 这原本的代码是给debian用的,对于嵌入式没必要这么麻烦
         # 删了这个,fstab里面那个奇怪的记录也就可以删了
+        self.__remount_cmd = remount_cmd
         self.__storage = Storage(self.get_mount_path(self.__partition_device), remount_cmd)
 
         self.__reader: (MsdFileReader | None) = None
@@ -309,7 +332,7 @@ class Plugin(BaseMsd):  # pylint: disable=too-many-instance-attributes
             # 返回完整状态信息
             return {
                 "enabled": self._enabled,
-                "online": (self._enabled and bool(vd) and self.__drive.is_enabled()),
+                "online": (self._enabled and (self.__drive.is_enabled() or self.__drive_partition.is_enabled())),
                 "busy": self.__state.is_busy(),
                 "storage": storage if self._enabled else None,
                 "drive": vd if self._enabled else None,
@@ -508,11 +531,6 @@ class Plugin(BaseMsd):  # pylint: disable=too-many-instance-attributes
         # 获取当前使用的分区设备路径（真实路径）
         current_partition = os.path.realpath(self.__partition_device)
 
-        if model_name == "rmq1":
-            MEDIA_PART_NAME = "mtdblock10"
-        else:
-            MEDIA_PART_NAME = "mmcblk0p10"
-
         # 读取 /proc/partitions 获取所有分区信息
         try:
             with open("/proc/partitions", "r") as f:
@@ -523,30 +541,40 @@ class Plugin(BaseMsd):  # pylint: disable=too-many-instance-attributes
                     if len(parts) == 4:
                         dev_name = parts[3]
                         size_kb = int(parts[2])  # 大小以KB为单位
-                        # 只处理 sd 开头的设备
-                        if dev_name.startswith("sd"):
-                            disk_name = dev_name.rstrip("0123456789") #去掉sda1这类的分区数字
-                            # 检查是否是 USB 设备
-                            try:
-                                # 不再检查removeable,因为有些U盘似乎也会被识别为非可移动设备
-                                # with open(f"/sys/block/{disk_name}/removable", "r") as f:
-                                #     removable = f.read().strip()
-                                # if removable == "1":
 
-                                # 如果是分区（设备名比磁盘名长）且是可移动设备，则添加到列表
-                                # 这里额外提一句,直接mkfs /dev/sda并非就不能用.但是拔出U盘插入电脑会直接在电脑上识别不出来,因为没有了引导
+                        # USB U盘：sd 开头的分区设备
+                        if dev_name.startswith("sd"):
+                            disk_name = dev_name.rstrip("0123456789")  # 去掉sda1这类的分区数字
+                            try:
+                                # 如果是分区（设备名比磁盘名长），则添加到列表
                                 if len(dev_name) > len(disk_name):
                                     dev_path = f"/dev/{dev_name}"
                                     partition_info = await self.__get_partition_info(dev_path, size_kb)
-                                    # 添加is_current字段标识是否为当前使用的分区
                                     partition_info["is_current"] = (dev_path == current_partition)
                                     devices[dev_path] = partition_info
                             except (IOError, OSError):
                                 continue
-                        if dev_name.startswith(MEDIA_PART_NAME):
+
+                        # TF 卡：mmcblkNpM 格式，通过 sysfs type="SD" 确认非 eMMC
+                        elif dev_name.startswith("mmcblk"):
+                            tf_match = re.match(r"(mmcblk\d+)p(\d+)$", dev_name)
+                            if tf_match:
+                                base_dev = tf_match.group(1)
+                                # 仅凭 sysfs device/type 判断，type="SD" 才加入列表
+                                # type="MMC" 为 eMMC，type 读不到时保守跳过
+                                if self.__is_tf_card_device(base_dev):
+                                    dev_path = f"/dev/{dev_name}"
+                                    try:
+                                        partition_info = await self.__get_partition_info(dev_path, size_kb)
+                                        partition_info["is_current"] = (dev_path == current_partition)
+                                        devices[dev_path] = partition_info
+                                    except (IOError, OSError):
+                                        continue
+
+                        # 内置 eMMC 媒体分区（固定分区名匹配）
+                        if dev_name.startswith(self._media_part_name):
                             dev_path = f"/dev/{dev_name}"
                             partition_info = await self.__get_partition_info(dev_path, size_kb)
-                            # 添加is_current字段标识是否为当前使用的分区
                             partition_info["is_current"] = (dev_path == current_partition)
                             devices[dev_path] = partition_info
         except (IOError, OSError) as e:
@@ -743,6 +771,12 @@ class Plugin(BaseMsd):  # pylint: disable=too-many-instance-attributes
                     self.__state.vd_partition.image = await self.__storage.make_image_by_path(new_uuid_path)
 
                     logger.info(f"Successfully updated partition_device to {new_uuid_path}")
+
+                    if model_name == "rmq1":
+                        await self.__run_command(
+                            "udevadm", ["trigger", "--subsystem-match=block", "--action=change"],
+                            "udevadm trigger command failed"
+                        )
                 else:
                     logger.info(f"UUID unchanged: {new_uuid}")
             elif os.path.realpath(current_partition_device) == real_device_path:
@@ -769,6 +803,12 @@ class Plugin(BaseMsd):  # pylint: disable=too-many-instance-attributes
                 self.__state.vd_partition.image = await self.__storage.make_image_by_path(new_uuid_path)
 
                 logger.info(f"Successfully converted partition_device to UUID path {new_uuid_path}")
+
+                if model_name == "rmq1":
+                    await self.__run_command(
+                        "udevadm", ["trigger", "--subsystem-match=block", "--action=change"],
+                        "udevadm trigger command failed"
+                    )
 
         except Exception as e:
             logger.error(f"Failed to check and update UUID: {e}")
@@ -817,6 +857,142 @@ class Plugin(BaseMsd):  # pylint: disable=too-many-instance-attributes
         await self.__reload_state()
 
     @aiotools.atomic_fg
+    async def switch_partition(self, new_device: str) -> dict:
+        # 不重启切换 MSD 后端分区: umount 旧 -> mount 新 -> 切换内部引用 -> 重建 Storage -> 写 boot.yaml
+        self._check_enabled()
+        logger = get_logger(0)
+
+        if not new_device or not new_device.strip():
+            raise MsdOperationError("device parameter cannot be empty")
+        new_device = new_device.strip()
+
+        resolved_new = os.path.realpath(new_device)
+        if not os.path.exists(resolved_new):
+            raise MsdOperationError(f"device {new_device!r} does not exist")
+
+        # by-uuid/by-name 等符号链接需要先解析到底层块设备才能匹配 mount_dict / sd* / mmcblkNpM
+        new_mount_path = self.get_mount_path(new_device) or self.get_mount_path(resolved_new)
+        if not new_mount_path:
+            raise MsdOperationError(f"no known mount point for device {new_device!r} (resolved: {resolved_new!r})")
+
+        old_device = self.__partition_device
+        resolved_old = os.path.realpath(old_device)
+
+        # 幂等: 已经在用同一个分区
+        if resolved_new == resolved_old:
+            return {
+                "device": new_device,
+                "resolved": resolved_new,
+                "mount_path": new_mount_path,
+                "changed": False,
+            }
+
+        # 拿锁之前的快速 busy 检查 (与 _State.busy() 的拒绝行为一致, 不进入锁)
+        if self.__state.is_busy() or self.__writer is not None or self.__reader is not None:
+            raise MsdIsBusyError()
+        if (self.__state.vd is not None and self.__state.vd.connected) or \
+           (self.__state.vd_partition is not None and self.__state.vd_partition.connected):
+            raise MsdConnectedError()
+
+        async with self.__state.busy():
+            # TOCTOU 复检: 进入临界区后再次确认未被 connect
+            if (self.__state.vd is not None and self.__state.vd.connected) or \
+               (self.__state.vd_partition is not None and self.__state.vd_partition.connected):
+                raise MsdConnectedError()
+
+            # 先 sync 刷盘, 避免脏页随 umount 丢失
+            await aiotools.run_async(os.sync)
+
+            old_mount_path = self.get_mount_path(old_device)
+
+            # 若新设备已经挂在目标点(例如 /dev/disk/by-uuid/xxx 与旧设备指向同一物理分区,
+            # 或系统自动挂载在该路径), 跳过 umount/mount 流程, 仅切换内部引用即可。
+            new_existing_mounts = await aiohelpers.get_mount_points(new_device)
+            if new_mount_path in new_existing_mounts:
+                logger.info(
+                    f"switch_partition: {new_device} already mounted at {new_mount_path}, "
+                    "skip umount/mount"
+                )
+            else:
+                logger.info(f"switch_partition: umount old {resolved_old}")
+                await aiohelpers.umount(resolved_old)
+
+                # 新设备若挂在别处, 先解挂避免重复挂载或挂载冲突
+                if new_existing_mounts:
+                    logger.info(
+                        f"switch_partition: {new_device} also mounted at "
+                        f"{new_existing_mounts}, umount before remount"
+                    )
+                    await aiohelpers.umount(resolved_new)
+
+                logger.info(f"switch_partition: mount new {new_device} -> {new_mount_path}")
+                ok = await aiohelpers.mount(new_device, new_mount_path, "rw", cmd=["mount"])
+                if not ok:
+                    # 回滚: 尝试把旧分区挂回去, 不影响异常上抛
+                    logger.error(
+                        f"switch_partition: mount {new_device} failed, rolling back to {old_device}"
+                    )
+                    if old_mount_path:
+                        try:
+                            await aiohelpers.mount(old_device, old_mount_path, "rw", cmd=["mount"])
+                        except Exception as ex:
+                            logger.error(f"switch_partition: rollback mount failed: {ex}")
+                    raise MsdOperationError(f"failed to mount {new_device} at {new_mount_path}")
+
+            # 切换内部状态
+            self.__partition_device = new_device
+            self.__storage = Storage(new_mount_path, self.__remount_cmd)
+
+            # 重建 vd_partition.image 引用 (此前已确认 vd_partition.connected == False)
+            if self.__state.vd_partition is not None:
+                try:
+                    self.__state.vd_partition.image = await self.__storage.make_image_by_path(new_device)
+                except Exception as ex:
+                    logger.warning(f"switch_partition: refresh vd_partition.image failed: {ex}")
+                    self.__state.vd_partition.image = None
+
+            # 同步 __state.storage / vd 等
+            await self.__unsafe_reload_state()
+
+        # 通知 systask 重建 inotify (新挂载点)
+        self.__notify_remount()
+        self.__notifier.notify()
+
+        # 持久化到 boot.yaml, 让下次启动也用新分区
+        try:
+            boot_config = await self.__read_boot_yaml()
+            if "kvmd" not in boot_config:
+                boot_config["kvmd"] = {}
+            if "msd" not in boot_config["kvmd"]:
+                boot_config["kvmd"]["msd"] = {}
+            boot_config["kvmd"]["msd"]["partition_device"] = new_device
+            await self.__write_boot_yaml(boot_config)
+            logger.info(f"switch_partition: boot.yaml updated, partition_device={new_device}")
+        except Exception as ex:
+            # 运行时已切换成功, 持久化失败仅告警
+            logger.error(f"switch_partition: failed to persist to boot.yaml: {ex}")
+
+        # 组装返回信息
+        size_kb = 0
+        try:
+            with open("/proc/partitions", "r") as f:
+                for line in f.readlines()[2:]:
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[3] == os.path.basename(resolved_new):
+                        size_kb = int(parts[2])
+                        break
+        except Exception as ex:
+            logger.warning(f"switch_partition: read /proc/partitions failed: {ex}")
+        info = await self.__get_partition_info(resolved_new, size_kb)
+        info.update({
+            "device": new_device,
+            "resolved": resolved_new,
+            "mount_path": new_mount_path,
+            "changed": True,
+        })
+        return info
+
+    @aiotools.atomic_fg
     async def __do_format(self,path: str = "") -> None:
         # 保留原本的设计,如果path为空,则使用partition_device
         if not path or path.strip() == "":
@@ -853,6 +1029,18 @@ class Plugin(BaseMsd):  # pylint: disable=too-many-instance-attributes
             get_logger(0).info(f"Formatting {path}")
             if not await self.__run_command("mkfs.exfat", [real_path], "mkfs.exfat command failed"):
                 raise Exception("Failed to format partition")
+
+            # Force udev to rescan and refresh /dev/disk/by-uuid/ symlinks after formatting.
+            # mmcblk(eMMC) devices auto-send change uevents, but mtdblock(NAND) devices do not,
+            # causing UUID symlinks to become stale and next partition_format to fail.
+            # Only needed for RMQ1 (NAND).
+            if model_name == "rmq1":
+                get_logger(0).info(f"Triggering udev rescan after formatting {real_path}")
+                await self.__run_command(
+                    "udevadm", ["trigger", "--subsystem-match=block", "--action=change"],
+                    "udevadm trigger failed (non-fatal)"
+                )
+                await asyncio.sleep(0.5)
 
             # 恢复原来的卷标,失败的话用GLKVM代替
             if old_label:
@@ -1117,12 +1305,15 @@ class Plugin(BaseMsd):  # pylint: disable=too-many-instance-attributes
                         self.__reset = False
                         need_reload_state = False
                         for event in (await inotify.get_series(timeout=1)):
-                            # 检查是否是USB设备变化事件
-                            if (event.path.startswith("/dev") and event.name and
-                                event.name.startswith("sd") and len(event.name) > 3):
-                                # 匹配/dev/sdX[数字]格式的USB分区设备
-                                logger.info("Detected USB device change: %s", event.path)
-                                need_reload_state = True
+                            # 检查是否是可移动存储设备变化事件
+                            if event.path.startswith("/dev") and event.name:
+                                is_usb = event.name.startswith("sd") and len(event.name) > 3
+                                # TF 卡：任何 mmcblkNpM 分区变化都触发 reload
+                                # partition_show() 内部会用 sysfs type="SD" 过滤，排除 eMMC
+                                is_tf = bool(re.match(r"mmcblk\d+p\d+$", event.name))
+                                if is_usb or is_tf:
+                                    logger.info("Detected removable storage change: %s/%s", event.path, event.name)
+                                    need_reload_state = True
                             elif not event.path.startswith("/dev"):
                                 # 非/dev目录的事件，按原逻辑处理
                                 need_reload_state = True

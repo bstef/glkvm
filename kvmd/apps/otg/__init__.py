@@ -26,6 +26,7 @@ import shutil
 import json
 import time
 import argparse
+import glob
 
 from os.path import join  # pylint: disable=ungrouped-imports
 
@@ -42,6 +43,8 @@ from .. import init
 from .hid import Hid
 from .hid.keyboard import make_keyboard_hid
 from .hid.mouse import make_mouse_hid
+from .hid.touch import make_touch_hid
+from . import mtp
 
 
 # =====
@@ -63,6 +66,46 @@ def _symlink(src: str, dest: str) -> None:
 def _rmdir(path: str) -> None:
     get_logger().info("RMDIR --- %s", path)
     os.rmdir(path)
+
+
+def _cleanup_uvc_function(path: str) -> None:
+    logger = get_logger()
+    logger.info("UVC_CLEAN - %s", path)
+
+    # Remove user-created UVC links/directories in reverse order.
+    for sp in [
+        "streaming/class/fs/h",
+        "streaming/class/hs/h",
+        "streaming/class/ss/h",
+        "streaming/header/h/u",
+        "control/class/fs/h",
+        "control/class/ss/h",
+    ]:
+        _unlink(join(path, sp), optional=True)
+
+    # Remove all dynamically created uncompressed resolution dirs.
+    uncompressed_path = join(path, "streaming/uncompressed/u")
+    if os.path.isdir(uncompressed_path):
+        for name in os.listdir(uncompressed_path):
+            child = join(uncompressed_path, name)
+            if os.path.isdir(child) and not os.path.islink(child):
+                try:
+                    _rmdir(child)
+                except OSError as ex:
+                    logger.info("UVC_CLEAN - [SKIPPED] %s: %s", child, ex)
+
+    # Remove user-created containers. Ignore failures for kernel-owned nodes.
+    for dp in [
+        "streaming/header/h",
+        "streaming/uncompressed/u",
+        "control/header/h",
+    ]:
+        try:
+            _rmdir(join(path, dp))
+        except OSError as ex:
+            logger.info("UVC_CLEAN - [SKIPPED] %s: %s", join(path, dp), ex)
+
+    _rmdir(path)
 
 
 def _unlink(path: str, optional: bool=False) -> None:
@@ -94,6 +137,7 @@ def _check_config(config: Section) -> None:
     if (
         not config.otg.devices.serial.enabled
         and not config.otg.devices.ethernet.enabled
+        and not config.otg.devices.mtp.enabled
         and config.kvmd.hid.type != "otg"
         and config.kvmd.msd.type != "otg"
     ):
@@ -126,15 +170,65 @@ class _GadgetConfig:
             self.__start_function(func, eps)
         self.__create_meta(func, product, eps)
 
-    def add_audio_mic_axera(self, start: bool, product: str) -> None:
+    def add_camera(self, start: bool, product: str) -> None:
         eps = 2
-        func = "uac1.usb0"
+        func = "uvc.gs6"
         func_path = self.__create_function(func)
-        _write(join(func_path, "c_chmask"), 0)
-        _write(join(func_path, "p_chmask"), 0b11)
-        _write(join(func_path, "p_srate"), 48000)
-        _write(join(func_path, "p_ssize"), 2)
-        _write(join(func_path, "function_name"), product,optional=True) #rm1 can't support function_name
+        _write(join(func_path, "device_name"), product, optional=True)
+        _write(join(func_path, "function_name"), product, optional=True)  # rm1 can't support function_name
+        config_path = join(self.__gadget_path, "configs/b.1")
+
+        _write(join(self.__gadget_path, "bcdDevice"), 0x0310)
+        _write(join(self.__gadget_path, "bDeviceProtocol"), 1)
+        _write(join(self.__gadget_path, "bDeviceSubClass"), 2)
+        _write(join(self.__gadget_path, "bDeviceClass"), 239)
+
+        _write(join(func_path, "streaming_maxpacket"), 3072)
+        _write(join(func_path, "uvc_num_request"), 2)
+                
+        control_header_path = join(func_path, "control/header/h")
+        if not os.path.exists(control_header_path):
+            _mkdir(control_header_path)
+        
+        _symlink(control_header_path,join(func_path, "control/class/fs/h"))
+        _symlink(control_header_path,join(func_path, "control/class/ss/h"))
+
+        streaming_path = join(func_path, "streaming/uncompressed/u")
+        if not os.path.exists(streaming_path):
+            _mkdir(streaming_path)
+
+        _write(join(streaming_path, "bBitsPerPixel"), 12)
+        _write_bytes(join(streaming_path, "guidFormat"),
+                     b'\x4e\x56\x31\x32\x00\x00\x10\x00\x80\x00\x00\xaa\x00\x38\x9b\x71')
+
+        res_path = join(streaming_path, "576p")
+        _mkdir(res_path)
+
+        width = 1024
+        height = 576
+        _write(join(res_path, "wWidth"), width)
+        _write(join(res_path, "wHeight"), height)
+        _write(join(res_path, "dwDefaultFrameInterval"), 333333)
+        _write(join(res_path, "dwMinBitRate"), width * height * 20)
+        _write(join(res_path, "dwMaxBitRate"), width * height * 20)
+        _write(join(res_path, "dwMaxVideoFrameBufferSize"), width * height * 2)
+        _write(join(res_path, "dwFrameInterval"), "333333\n666666\n1000000\n2000000")
+        # _write(join(res_path, "bFrameIndex"), 1)
+        
+        streaming_header_path = join(func_path, "streaming/header/h")
+        if not os.path.exists(streaming_header_path):
+            _mkdir(streaming_header_path)
+        
+        _symlink(streaming_path,join(streaming_header_path, "u"))
+        _symlink(streaming_header_path,join(func_path, "streaming/class/fs/h"))
+        _symlink(streaming_header_path,join(func_path, "streaming/class/ss/h"))
+        _symlink(streaming_header_path,join(func_path, "streaming/class/hs/h"))
+        
+        os_desc_path = join(self.__gadget_path, "os_desc")
+        if not os.path.exists(os_desc_path):
+            _mkdir(os_desc_path)    
+        _symlink(config_path,join(os_desc_path, "b.1"))
+                                           
         if start:
             self.__start_function(func, eps)
         self.__create_meta(func, product, eps)
@@ -187,12 +281,23 @@ class _GadgetConfig:
             _symlink(func_path, join(self.__profile_path, func))
         self.__create_meta(func, "RNDIS",eps)
 
+    def add_mtp(self, start: bool) -> None:
+        eps = 3
+        func = "ffs.mtp"
+        self.__create_function(func)
+        if start:
+            self.__start_function(func, eps)
+        self.__create_meta(func, "MTP Storage", eps)
+
     def add_keyboard(self, start: bool, remote_wakeup: bool) -> None:
         self.__add_hid("Keyboard", start, remote_wakeup, make_keyboard_hid())
 
     def add_mouse(self, start: bool, remote_wakeup: bool, absolute: bool, horizontal_wheel: bool) -> None:
         desc = ("Absolute" if absolute else "Relative") + " Mouse"
         self.__add_hid(desc, start, remote_wakeup, make_mouse_hid(absolute, horizontal_wheel))
+
+    def add_touch(self, start: bool, remote_wakeup: bool) -> None:
+        self.__add_hid("Touch Screen", start, remote_wakeup, make_touch_hid())
 
     def __add_hid(self, desc: str, start: bool, remote_wakeup: bool, hid: Hid) -> None:
         eps = 1
@@ -333,14 +438,13 @@ def _cmd_start(config: Section) -> None:  # pylint: disable=too-many-statements,
     gc = _GadgetConfig(gadget_path, profile_path, config.otg.meta, config.otg.endpoints)
     cod = config.otg.devices
 
-    if model == "rmq1":
-        if cod.audio.enabled:
-            logger.info("===== Microphone rmq1 %s =====", model)
-            gc.add_audio_mic_axera(cod.audio.start, cod.audio.product)
-
     if cod.rndis.enabled:
         logger.info("===== RNDIS =====")
         gc.add_rndis(cod.rndis.start)
+
+    if cod.mtp.enabled:
+        logger.info("===== MTP =====")
+        gc.add_mtp(cod.mtp.start)
 
     if config.kvmd.hid.type == "otg":
         ckhm = config.kvmd.hid.mouse
@@ -353,6 +457,9 @@ def _cmd_start(config: Section) -> None:  # pylint: disable=too-many-statements,
         if cod.hid.mouse_alt.enabled and cod.hid.mouse_alt.device:
             logger.info("===== HID-Mouse-Alt =====")
             gc.add_mouse(cod.hid.mouse_alt.start, config.otg.remote_wakeup, (not ckhm.absolute), ckhm.horizontal_wheel)
+        if cod.hid.touch.enabled:
+            logger.info("===== HID-Touch =====")
+            gc.add_touch(cod.hid.touch.start, config.otg.remote_wakeup)
 
     if config.kvmd.msd.type == "otg":
         logger.info("===== MSD =====")
@@ -397,18 +504,34 @@ def _cmd_start(config: Section) -> None:  # pylint: disable=too-many-statements,
         logger.info("===== Serial =====")
         gc.add_serial(cod.serial.start)
 
-    if model != "rmq1":
-        if cod.audio.enabled:
-            logger.info("===== Microphone %s =====", model)
-            gc.add_audio_mic(cod.audio.start, cod.audio.product)
+    if cod.audio.enabled:
+        logger.info("===== Microphone %s =====", model)
+        gc.add_audio_mic(cod.audio.start, cod.audio.product)
+        
+    if cod.camera.enabled:
+        logger.info("===== Camera =====")
+        gc.add_camera(cod.camera.start, cod.camera.product)
 
     logger.info("===== Preparing complete =====")
 
-    logger.info("Enabling the gadget ...")
-    _write(join(gadget_path, "UDC"), udc)
-    time.sleep(config.otg.init_delay)
-    _chown(join(gadget_path, "UDC"), config.otg.user)
-    _chown(profile_path, config.otg.user)
+    mtp_started = os.path.islink(join(profile_path, "ffs.mtp"))
+    if mtp_started:
+        logger.info("Preparing uMTPrd ...")
+        mtp.prepare(config.otg.init_delay)
+
+    try:
+        logger.info("Enabling the gadget ...")
+        _write(join(gadget_path, "UDC"), udc)
+        time.sleep(config.otg.init_delay)
+        _chown(join(gadget_path, "UDC"), config.otg.user)
+        _chown(profile_path, config.otg.user)
+    except Exception:
+        if mtp_started:
+            try:
+                mtp.cleanup()
+            except Exception as ex:
+                logger.error("Can't clean up uMTPrd after gadget start failure: %s", ex)
+        raise
 
     logger.info("Ready to work")
 
@@ -425,19 +548,24 @@ def _cmd_stop(config: Section) -> None:
 
     logger.info("Disabling gadget %r ...", config.otg.gadget)
     _write(join(gadget_path, "UDC"), "\n")
+    if os.path.isdir(join(gadget_path, "functions/ffs.mtp")):
+        logger.info("Stopping uMTPrd ...")
+        mtp.cleanup()
 
     _unlink(join(gadget_path, "os_desc", usb.G_PROFILE_NAME), optional=True)
 
     profile_path = join(gadget_path, usb.G_PROFILE)
     for func in os.listdir(profile_path):
-        if re.search(r"\.usb\d+$", func) or re.search(r"mass_storage\.\d+$", func):
+        if re.search(r"\.usb\d+$", func) or re.search(r"mass_storage\.\d+$", func) or re.search(r"\.gs\d+$", func) or func == "ffs.mtp":
             _unlink(join(profile_path, func))
     _rmdir(join(profile_path, "strings/0x409"))
     _rmdir(profile_path)
 
     funcs_path = join(gadget_path, "functions")
     for func in os.listdir(funcs_path):
-        if re.search(r"\.usb\d+$", func) or re.search(r"mass_storage\.\d+$", func):
+        if func.startswith("uvc."):
+            _cleanup_uvc_function(join(funcs_path, func))
+        elif re.search(r"\.usb\d+$", func) or re.search(r"mass_storage\.\d+$", func) or re.search(r"\.gs\d+$", func) or func == "ffs.mtp":
             _rmdir(join(funcs_path, func))
 
     _rmdir(join(gadget_path, "strings/0x409"))

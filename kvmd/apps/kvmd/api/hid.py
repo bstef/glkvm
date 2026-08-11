@@ -20,6 +20,7 @@
 # ========================================================================== #
 
 
+import asyncio
 import json
 import os
 import stat
@@ -58,6 +59,9 @@ from ....validators.hid import valid_hid_mouse_move
 from ....validators.hid import valid_hid_mouse_button
 from ....validators.hid import valid_hid_mouse_delta
 from ....validators.hid import valid_hid_jiggler_schedule
+from ....validators.hid import valid_hid_jiggler_interval
+
+from .config_utils import set_yaml_value
 
 
 _JIGGLER_SCHEDULE_PATH = "/etc/kvmd/user/jiggler_schedule.json"
@@ -109,10 +113,19 @@ class HidApi:
                 ("keyboard_output", valid_hid_keyboard_output),
                 ("mouse_output", valid_hid_mouse_output),
                 ("jiggler", valid_bool),
+                ("jiggler_interval", valid_hid_jiggler_interval),
             ]
             if req.query.get(key) is not None
         }
-        self.__hid.set_params(**params)  # type: ignore
+        interval = params.pop("jiggler_interval", None)
+        if params:
+            self.__hid.set_params(**params)  # type: ignore
+        if interval is not None:
+            self.__hid.set_jiggler_interval(interval)
+            # 持久化进配置体系(main.yaml 的 override 链会加载 user/boot.yaml),
+            # 下次启动由 BaseHid 的 jiggler.interval Option 直接读到
+            await set_yaml_value("kvmd/hid/jiggler/interval", interval)
+            await self.__hid.trigger_state()
         return make_json_response()
 
     @exposed_http("POST", "/hid/set_jiggler_schedule")
@@ -161,7 +174,23 @@ class HidApi:
             text = text[:limit]
         symmap = self.__ensure_symmap(req.query.get("keymap", self.__default_keymap_name))
         slow = valid_bool(req.query.get("slow", False))
-        await self.__hid.send_key_events(text_to_evdev_keys(text, symmap), no_ignore_keys=True, slow=slow)
+        paste_task = asyncio.ensure_future(self.__hid.send_key_events(
+            text_to_evdev_keys(text, symmap), no_ignore_keys=True, slow=slow,
+        ))
+        async def _wait_disconnect() -> None:
+            while not paste_task.done():
+                if req.transport is None or req.transport.is_closing():
+                    paste_task.cancel()
+                    return
+                await asyncio.sleep(0.05)
+        checker = asyncio.ensure_future(_wait_disconnect())
+        try:
+            await paste_task
+        except asyncio.CancelledError:
+            self.__hid.clear_events()
+        finally:
+            if not checker.done():
+                checker.cancel()
         return make_json_response()
 
     def __ensure_symmap(self, keymap_name: str) -> dict[int, dict[int, int]]:
@@ -226,6 +255,17 @@ class HidApi:
     async def __ws_bin_mouse_wheel_handler(self, _: WsSession, data: bytes) -> None:
         self.__process_ws_bin_delta_request(data, self.__hid.send_mouse_wheel_events)
 
+    @exposed_ws(6)
+    async def __ws_bin_touch_handler(self, _: WsSession, data: bytes) -> None:
+        try:
+            touching = bool(data[0] & 0b01)
+            (to_x, to_y) = struct.unpack(">hh", data[1:])
+            to_x = valid_hid_mouse_move(to_x)
+            to_y = valid_hid_mouse_move(to_y)
+        except Exception:
+            return
+        self.__hid.send_touch_event(to_x, to_y, touching)
+
     def __process_ws_bin_delta_request(self, data: bytes, handler: Callable[[Iterable[tuple[int, int]], bool], None]) -> None:
         try:
             squash = bool(data[0] & 0b01)
@@ -275,6 +315,16 @@ class HidApi:
     @exposed_ws("mouse_wheel")
     async def __ws_mouse_wheel_handler(self, _: WsSession, event: dict) -> None:
         self.__process_ws_delta_event(event, self.__hid.send_mouse_wheel_events)
+
+    @exposed_ws("touch")
+    async def __ws_touch_handler(self, _: WsSession, event: dict) -> None:
+        try:
+            to_x = valid_hid_mouse_move(event["to"]["x"])
+            to_y = valid_hid_mouse_move(event["to"]["y"])
+            touching = valid_bool(event["touching"])
+        except Exception:
+            return
+        self.__hid.send_touch_event(to_x, to_y, touching)
 
     def __process_ws_delta_event(self, event: dict, handler: Callable[[Iterable[tuple[int, int]], bool], None]) -> None:
         try:
@@ -339,6 +389,14 @@ class HidApi:
     @exposed_http("POST", "/hid/events/send_mouse_wheel")
     async def __events_send_mouse_wheel_handler(self, req: Request) -> Response:
         return self.__process_http_delta_event(req, self.__hid.send_mouse_wheel_event)
+
+    @exposed_http("POST", "/hid/events/send_touch")
+    async def __events_send_touch_handler(self, req: Request) -> Response:
+        to_x = valid_hid_mouse_move(req.query.get("to_x"))
+        to_y = valid_hid_mouse_move(req.query.get("to_y"))
+        touching = valid_bool(req.query.get("touching"))
+        self.__hid.send_touch_event(to_x, to_y, touching)
+        return make_json_response()
 
     def __process_http_delta_event(self, req: Request, handler: Callable[[int, int], None]) -> Response:
         delta_x = valid_hid_mouse_delta(req.query.get("delta_x"))

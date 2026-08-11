@@ -40,7 +40,7 @@ def valid_hid_keyboard_output(arg: Any) -> str:
 
 
 def valid_hid_mouse_output(arg: Any) -> str:
-    return check_string_in_list(arg, "Mouse output", ["usb", "usb_win98", "usb_rel", "ps2", "disabled"])
+    return check_string_in_list(arg, "Mouse output", ["usb", "usb_win98", "usb_rel", "usb_hybrid", "usb_touch", "ps2", "disabled"])
 
 
 def valid_hid_key(arg: Any) -> str:
@@ -59,6 +59,10 @@ def valid_hid_mouse_button(arg: Any) -> str:
 def valid_hid_mouse_delta(arg: Any) -> int:
     arg = valid_number(arg, name="Mouse delta")
     return MouseDelta.normalize(arg)
+
+
+def valid_hid_jiggler_interval(arg: Any) -> int:
+    return int(valid_number(arg, min=1, max=3600, name="jiggler interval"))
 
 
 def valid_hid_jiggler_time(arg: Any) -> str:

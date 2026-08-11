@@ -30,20 +30,21 @@ from typing import AsyncGenerator
 
 # =====
 class LogReader:
-    def __init__(self):
+    def __init__(self, log_file: str='/var/log/kvmd.log', max_bytes: int=512 * 1024, backup_count: int=2):
+        self.log_file = log_file
         self.logger = logging.getLogger('kvmd')
         self.logger.setLevel(logging.DEBUG)
         handler = RotatingFileHandler(
-            filename='/var/log/kvmd.log',
-            maxBytes=512 * 1024,
-            backupCount=2,
+            filename=self.log_file,
+            maxBytes=max_bytes,
+            backupCount=backup_count,
         )
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         handler.setFormatter(formatter)
         self.logger.addHandler(handler)
 
     async def poll_log(self, seek: int, follow: bool) -> AsyncGenerator[dict, None]:
-        with open('/var/log/kvmd.log', 'r') as log_file:
+        with open(self.log_file, 'r') as log_file:
             if seek > 0:
                 log_file.seek(0, 2)
                 file_size = log_file.tell()

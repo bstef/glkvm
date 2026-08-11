@@ -26,17 +26,29 @@ from aiohttp.web import Response
 
 from ....htserver import UnauthorizedError
 from ....htserver import ForbiddenError
+from ....htserver import BadRequestError
 from ....htserver import HttpExposed
 from ....htserver import exposed_http
 from ....htserver import make_json_response
 from ....htserver import make_json_exception
 from ....htserver import set_request_auth_info
 
+from ....validators import ValidatorError
 from ....validators.auth import valid_user
 from ....validators.auth import valid_passwd
+from ....validators.auth import valid_new_passwd
 from ....validators.auth import valid_auth_token
 
 from ..init import InitManager
+from ..init import WeakPasswordError
+from ..init import InvalidOldPasswordError
+
+
+# 新密码不满足强密码规则时返回给前端的提示
+_WEAK_PASSWORD_MSG = (
+    "Password must be 10-63 characters and contain at least two of: "
+    "uppercase letters, lowercase letters, digits, special characters"
+)
 
 
 # 在设备第一次启动的时候,要求用户设置密码进行初始化
@@ -49,15 +61,18 @@ class InitApi:
 
     @exposed_http("GET", "/init/init", auth_required=False)
     async def __init_handler(self, req: Request) -> Response:
-        if not self.__init_manager.is_inited():
-            unsafe_password = req.query.get("password", "")
-            safe_password = valid_passwd(unsafe_password)
-            if unsafe_password != safe_password:
-                return make_json_exception(ForbiddenError(),403)
-            self.__init_manager.init(safe_password)
-            return make_json_response()
-        else:
-            return make_json_exception(ForbiddenError(),403)
+        if self.__init_manager.is_inited():
+            return make_json_exception(ForbiddenError("Already initialized"), 403)
+
+        unsafe_password = req.query.get("password", "")
+        # 初始化密码需满足强密码规则:长度 10~63,且大写字母/小写字母/数字/特殊字符
+        # 四类中至少包含两类。不符合规则时返回 400 并带明确原因。
+        try:
+            safe_password = valid_new_passwd(unsafe_password)
+        except ValidatorError:
+            return make_json_exception(BadRequestError(_WEAK_PASSWORD_MSG), 400)
+        self.__init_manager.init(safe_password)
+        return make_json_response()
 
     @exposed_http("GET", "/init/is_inited", auth_required=False)
     async def __is_inited_handler(self, req: Request) -> Response:
@@ -82,9 +97,15 @@ class InitApi:
         user = req.query.get("user")
         old_password = req.query.get("old_password")
         new_password = req.query.get("new_password")
-        
+
         try:
             self.__init_manager.change_password(user, old_password, new_password)
             return make_json_response()
-        except Exception as e:
+        except WeakPasswordError:
+            # 新密码不满足强密码规则 -> 400,带明确原因
+            return make_json_exception(BadRequestError(_WEAK_PASSWORD_MSG), 400)
+        except InvalidOldPasswordError:
+            # 旧密码错误 -> 401
+            return make_json_exception(UnauthorizedError("Old password is incorrect"), 401)
+        except Exception:
             return make_json_exception(ForbiddenError(), 403)

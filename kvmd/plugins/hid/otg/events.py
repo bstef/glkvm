@@ -161,6 +161,26 @@ class MouseWheelEvent(BaseEvent):
         assert MouseDelta.MIN <= self.delta_y <= MouseDelta.MAX
 
 
+@dataclasses.dataclass(frozen=True)
+class TouchEvent(BaseEvent):
+    to_x: int
+    to_y: int
+    touching: bool
+    to_fixed_x: int = 0
+    to_fixed_y: int = 0
+
+    def __post_init__(self) -> None:
+        assert MouseRange.MIN <= self.to_x <= MouseRange.MAX
+        assert MouseRange.MIN <= self.to_y <= MouseRange.MAX
+        object.__setattr__(self, "to_fixed_x", MouseRange.remap(self.to_x, 0, MouseRange.MAX))
+        object.__setattr__(self, "to_fixed_y", MouseRange.remap(self.to_y, 0, MouseRange.MAX))
+
+
+def make_touch_report(flags: int, x: int, y: int) -> bytes:
+    # flags bit0 = Tip Switch, bit1 = In Range
+    return struct.pack("<BHH", flags, x, y)
+
+
 def make_mouse_report(
     absolute: bool,
     buttons: int,

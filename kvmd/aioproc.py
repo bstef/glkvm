@@ -91,36 +91,25 @@ async def log_stdout_infinite(proc: asyncio.subprocess.Process, logger: logging.
 async def kill_process(proc: asyncio.subprocess.Process, wait: float, logger: logging.Logger) -> None:  # pylint: disable=no-member
     if proc.returncode is None:
         try:
-            # 尝试温和终止进程
+            # 先 SIGTERM，限时等待；超时再 SIGKILL
             logger.debug("Terminating process pid=%d", proc.pid)
             proc.terminate()
-            
-            # 设置等待超时
             try:
                 await asyncio.wait_for(proc.wait(), wait)
                 logger.info("Process terminated: retcode=%d", proc.returncode)
                 return
             except asyncio.TimeoutError:
                 logger.warning("Process termination timed out after %.1f seconds, sending SIGKILL", wait)
-            
-            # 如果进程仍在运行，使用 SIGKILL
+
             if proc.returncode is None:
                 try:
                     logger.debug("Killing process group pgid=%d", os.getpgid(proc.pid))
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                    
-                    # 再次等待，但有超时限制
-                    try:
-                        await asyncio.wait_for(proc.wait(), wait)
-                    except asyncio.TimeoutError:
-                        logger.error("Process still alive after SIGKILL and %.1f seconds wait, giving up", wait)
-                        return
                 except ProcessLookupError:
-                    # 进程可能已经终止，但我们还没有获取到返回码
+                    # 进程已退出，仍需下方 wait() 收尸
                     pass
-                except Exception as e:
-                    logger.exception("Error sending SIGKILL to process group: %s", str(e))
-                    # 尝试直接杀死进程而不是进程组
+                except Exception:
+                    logger.exception("Error sending SIGKILL to process group")
                     if proc.returncode is None:
                         try:
                             os.kill(proc.pid, signal.SIGKILL)
@@ -128,19 +117,12 @@ async def kill_process(proc: asyncio.subprocess.Process, wait: float, logger: lo
                             pass
                         except Exception:
                             logger.exception("Can't kill process pid=%d directly", proc.pid)
-            
-            # 最后检查进程状态
-            if proc.returncode is not None:
-                logger.info("Process killed: retcode=%d", proc.returncode)
-            else:
-                # 最后一次尝试等待，有超时限制
-                try:
-                    await asyncio.wait_for(proc.wait(), wait)
-                    logger.info("Process killed: retcode=%d", proc.returncode)
-                except asyncio.TimeoutError:
-                    logger.error("Failed to kill process pid=%d after multiple attempts", proc.pid)
+
+            # SIGKILL 之后必须 wait 收尸，不能超时放弃，否则会留下僵尸进程
+            if proc.returncode is None:
+                await proc.wait()
+            logger.info("Process killed: retcode=%d", proc.returncode)
         except asyncio.CancelledError:
-            # 如果当前任务被取消，不要抛出异常
             pass
         except Exception:
             logger.exception("Unexpected error while killing process pid=%d", proc.pid)

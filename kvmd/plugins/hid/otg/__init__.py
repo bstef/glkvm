@@ -27,6 +27,8 @@ import asyncio
 from typing import AsyncGenerator
 from typing import Any
 
+from evdev import ecodes
+
 from ....logging import get_logger
 
 from .... import aiomulti
@@ -43,6 +45,7 @@ from .. import BaseHid
 
 from .keyboard import KeyboardProcess
 from .mouse import MouseProcess
+from .touch import TouchProcess
 
 from ....utils import get_model_name
 
@@ -60,6 +63,7 @@ class Plugin(BaseHid):  # pylint: disable=too-many-instance-attributes
         keyboard: dict[str, Any],
         mouse: dict[str, Any],
         mouse_alt: dict[str, Any],
+        touch: dict[str, Any],
         noop: bool,
 
         udc: str,  # XXX: Not from options, see /kvmd/apps/kvmd/__init__.py for details
@@ -93,6 +97,34 @@ class Plugin(BaseHid):  # pylint: disable=too-many-instance-attributes
                 # На самом деле мультимышка и win95 не зависят друг от друга,
                 # но так было проще реализовать переключение режимов
                 self.__mouses["usb_win98"] = self.__mouses["usb"]
+
+        self.__touch_proc: (TouchProcess | None) = None
+        self.__touch_device_path = ""
+        if touch.get("device_path"):
+            self.__touch_proc = TouchProcess(**common, **touch)
+            self.__touch_device_path = touch["device_path"]
+        self.__touch_mode = False
+        # Last known pointer position while in usb_touch mode (mouse-gesture emulation).
+        self.__touch_sim_x = 0
+        self.__touch_sim_y = 0
+        self.__touch_sim_down = False
+
+        self.__hybrid_mode = False
+        self.__mouse_abs: (MouseProcess | None) = None
+        self.__mouse_rel: (MouseProcess | None) = None
+        self.__mouse_device_paths: dict[str, str] = {}
+        if self.__mouses:
+            self.__mouse_abs = self.__mouses["usb"]
+            self.__mouse_rel = self.__mouses["usb_rel"]
+            if mouse["absolute"]:
+                self.__mouse_device_paths["usb"] = mouse["device_path"]
+                self.__mouse_device_paths["usb_rel"] = mouse_alt["device_path"]
+            else:
+                self.__mouse_device_paths["usb"] = mouse_alt["device_path"]
+                self.__mouse_device_paths["usb_rel"] = mouse["device_path"]
+        else:
+            output = ("usb" if mouse["absolute"] else "usb_rel")
+            self.__mouse_device_paths[output] = mouse["device_path"]
 
         self._set_jiggler_absolute(self.__mouse_current.is_absolute())
 
@@ -136,6 +168,12 @@ class Plugin(BaseHid):  # pylint: disable=too-many-instance-attributes
                 # Also no absolute_win98_fix
                 "horizontal_wheel": Option(True, type=valid_bool),
             },
+            "touch": {
+                "device":         Option("/dev/hidg3", type=valid_abs_path, if_empty="", unpack_as="device_path"),
+                "select_timeout": Option(0.1, type=valid_float_f01),
+                "queue_timeout":  Option(0.1, type=valid_float_f01),
+                "write_retries":  Option(150, type=valid_int_f1),
+            },
             "noop": Option(False, type=valid_bool),
             **cls._get_base_options(),
         }
@@ -147,7 +185,9 @@ class Plugin(BaseHid):  # pylint: disable=too-many-instance-attributes
         self.__mouse_proc.start(udc)
         if self.__mouse_alt_proc:
             self.__mouse_alt_proc.start(udc)
-        
+        if self.__touch_proc:
+            self.__touch_proc.start(udc)
+
     async def systask(self) -> None:
         """系统任务：启动 link_state 监听和父类的 jiggler 功能"""
         # 查找存在的 link_state 文件
@@ -218,7 +258,13 @@ class Plugin(BaseHid):  # pylint: disable=too-many-instance-attributes
 
     async def get_state(self) -> dict:
         keyboard_state = await self.__keyboard_proc.get_state()
-        mouse_state = await self.__mouse_current.get_state()
+        if self.__touch_mode and self.__touch_proc:
+            touch_state = await self.__touch_proc.get_state()
+            mouse_state = {"online": touch_state.get("online", True), "absolute": True}
+        elif self.__hybrid_mode:
+            mouse_state = {**(await self.__mouse_abs.get_state()), "absolute": True}  # type: ignore
+        else:
+            mouse_state = await self.__mouse_current.get_state()
         return {
             "enabled": True,
             "online": True,
@@ -235,7 +281,7 @@ class Plugin(BaseHid):  # pylint: disable=too-many-instance-attributes
             },
             "mouse": {
                 "outputs": {
-                    "available": list(self.__mouses),
+                    "available": self.__get_mouse_outputs_available(),
                     "active": self.__get_current_mouse_mode(),
                 },
                 **mouse_state,
@@ -261,6 +307,8 @@ class Plugin(BaseHid):  # pylint: disable=too-many-instance-attributes
         self.__mouse_proc.send_reset_event()
         if self.__mouse_alt_proc:
             self.__mouse_alt_proc.send_reset_event()
+        if self.__touch_proc:
+            self.__touch_proc.send_reset_event()
 
     async def cleanup(self) -> None:
         try:
@@ -269,8 +317,12 @@ class Plugin(BaseHid):  # pylint: disable=too-many-instance-attributes
             try:
                 self.__mouse_proc.cleanup()
             finally:
-                if self.__mouse_alt_proc:
-                    self.__mouse_alt_proc.cleanup()
+                try:
+                    if self.__mouse_alt_proc:
+                        self.__mouse_alt_proc.cleanup()
+                finally:
+                    if self.__touch_proc:
+                        self.__touch_proc.cleanup()
 
     # =====
 
@@ -282,11 +334,57 @@ class Plugin(BaseHid):  # pylint: disable=too-many-instance-attributes
     ) -> None:
 
         _ = keyboard_output
-        if mouse_output in self.__mouses and mouse_output != self.__get_current_mouse_mode():
-            self.__mouse_current.send_clear_event()
-            self.__mouse_current = self.__mouses[mouse_output]
-            self.__mouse_current.set_win98_fix(mouse_output == "usb_win98")
-            self._set_jiggler_absolute(self.__mouse_current.is_absolute())
+        changed = False
+        if mouse_output == "usb_touch":
+            if not self.__touch_proc:
+                get_logger(0).warning("Touch mouse mode requires touch device")
+            elif not self.__touch_mode:
+                self.__clear_mouse_state()
+                if self.__hybrid_mode:
+                    self.__hybrid_mode = False
+                    get_logger(0).info("HID mouse: left hybrid mode")
+                self.__touch_mode = True
+                self._set_jiggler_absolute(True)
+                get_logger(0).info(
+                    "HID mouse: entered touch mode (events -> usb_touch [%s])",
+                    self.__touch_device_path or "?",
+                )
+                changed = True
+        elif mouse_output == "usb_hybrid":
+            if not self.__mouse_alt_proc or not self.__mouse_abs or not self.__mouse_rel:
+                get_logger(0).warning("Hybrid mouse mode requires mouse_alt device")
+            elif not self.__hybrid_mode:
+                if self.__touch_mode:
+                    self.__touch_mode = False
+                    self.__clear_touch_state()
+                    get_logger(0).info("HID mouse: left touch mode")
+                self.__clear_mouse_state()
+                self.__hybrid_mode = True
+                self._set_jiggler_absolute(True)
+                get_logger(0).info(
+                    "HID mouse: entered hybrid mode (move -> %s [%s], button/wheel -> %s [%s])",
+                    "usb", self.__mouse_device_paths.get("usb", "?"),
+                    "usb_rel", self.__mouse_device_paths.get("usb_rel", "?"),
+                )
+                changed = True
+        elif mouse_output in self.__mouses:
+            if self.__hybrid_mode:
+                self.__hybrid_mode = False
+                self.__clear_mouse_state()
+                get_logger(0).info("HID mouse: left hybrid mode")
+                changed = True
+            if self.__touch_mode:
+                self.__touch_mode = False
+                self.__clear_touch_state()
+                get_logger(0).info("HID mouse: left touch mode")
+                changed = True
+            if mouse_output != self.__get_current_mouse_mode():
+                self.__mouse_current.send_clear_event()
+                self.__mouse_current = self.__mouses[mouse_output]
+                self.__mouse_current.set_win98_fix(mouse_output == "usb_win98")
+                self._set_jiggler_absolute(self.__mouse_current.is_absolute())
+                changed = True
+        if changed:
             self.__notifier.notify()
         if jiggler is not None:
             self._set_jiggler_active(jiggler)
@@ -296,26 +394,116 @@ class Plugin(BaseHid):  # pylint: disable=too-many-instance-attributes
         self.__keyboard_proc.send_key_event(key, state)
 
     def _send_mouse_button_event(self, button: int, state: bool) -> None:
-        self.__mouse_current.send_button_event(button, state)
+        if self.__touch_mode and self.__touch_proc:
+            # Only left button translates to touch press/release;
+            # right/middle/back/forward have no touchscreen equivalent.
+            if button == ecodes.BTN_LEFT:
+                self.__touch_sim_down = state
+                get_logger(0).info(
+                    "HID touch [button]: button=%d state=%s | device=%s",
+                    button, state, self.__touch_device_path or "?",
+                )
+                self.__touch_proc.send_touch_event(self.__touch_sim_x, self.__touch_sim_y, state)
+            else:
+                get_logger(0).debug(
+                    "HID touch [button]: dropped button=%d state=%s in touch mode",
+                    button, state,
+                )
+            return
+        proc = self.__get_hybrid_mouse_rel() if self.__hybrid_mode else self.__mouse_current
+        proc.send_button_event(button, state)
 
     def _send_mouse_move_event(self, to_x: int, to_y: int) -> None:
-        self.__mouse_current.send_move_event(to_x, to_y)
+        if self.__touch_mode and self.__touch_proc:
+            self.__touch_sim_x = to_x
+            self.__touch_sim_y = to_y
+            get_logger(0).info(
+                "HID touch [move]: to_x=%d to_y=%d touching=%s | device=%s",
+                to_x, to_y, self.__touch_sim_down, self.__touch_device_path or "?",
+            )
+            self.__touch_proc.send_touch_event(to_x, to_y, self.__touch_sim_down)
+            return
+        proc = self.__get_hybrid_mouse_abs() if self.__hybrid_mode else self.__mouse_current
+        proc.send_move_event(to_x, to_y)  # type: ignore
 
     def _send_mouse_relative_event(self, delta_x: int, delta_y: int) -> None:
+        if self.__touch_mode:
+            get_logger(0).debug(
+                "HID touch [relative]: dropped in touch mode (delta_x=%d delta_y=%d)",
+                delta_x, delta_y,
+            )
+            return
+        if self.__hybrid_mode:
+            get_logger(0).debug(
+                "HID mouse [relative]: dropped in hybrid mode (delta_x=%d delta_y=%d)",
+                delta_x, delta_y,
+            )
+            return
         self.__mouse_current.send_relative_event(delta_x, delta_y)
 
     def _send_mouse_wheel_event(self, delta_x: int, delta_y: int) -> None:
-        self.__mouse_current.send_wheel_event(delta_x, delta_y)
+        if self.__touch_mode:
+            get_logger(0).debug(
+                "HID touch [wheel]: dropped in touch mode (delta_x=%d delta_y=%d)",
+                delta_x, delta_y,
+            )
+            return
+        proc = self.__get_hybrid_mouse_rel() if self.__hybrid_mode else self.__mouse_current
+        proc.send_wheel_event(delta_x, delta_y)
+
+    def _send_touch_event(self, to_x: int, to_y: int, touching: bool) -> None:
+        # Real touch events from web UI always go to the touch HID,
+        # independent of the current mouse_output mode.
+        if not self.__touch_proc:
+            get_logger(0).debug("HID touch [event]: dropped, no touch device")
+            return
+        get_logger(0).info(
+            "HID touch [event]: to_x=%d to_y=%d touching=%s | device=%s",
+            to_x, to_y, touching, self.__touch_device_path or "?",
+        )
+        self.__touch_proc.send_touch_event(to_x, to_y, touching)
+
+    def __get_hybrid_mouse_abs(self) -> MouseProcess:
+        assert self.__mouse_abs is not None
+        return self.__mouse_abs
+
+    def __get_hybrid_mouse_rel(self) -> MouseProcess:
+        assert self.__mouse_rel is not None
+        return self.__mouse_rel
 
     def _clear_events(self) -> None:
         self.__keyboard_proc.send_clear_event()
         self.__mouse_proc.send_clear_event()
         if self.__mouse_alt_proc:
             self.__mouse_alt_proc.send_clear_event()
+        if self.__touch_proc:
+            self.__touch_proc.send_clear_event()
 
     # =====
 
+    def __clear_mouse_state(self) -> None:
+        self.__mouse_proc.send_clear_event()
+        if self.__mouse_alt_proc:
+            self.__mouse_alt_proc.send_clear_event()
+
+    def __clear_touch_state(self) -> None:
+        self.__touch_sim_down = False
+        if self.__touch_proc:
+            self.__touch_proc.send_clear_event()
+
+    def __get_mouse_outputs_available(self) -> list[str]:
+        avail = list(self.__mouses.keys())
+        if self.__mouse_alt_proc:
+            avail.append("usb_hybrid")
+        if self.__touch_proc:
+            avail.append("usb_touch")
+        return avail
+
     def __get_current_mouse_mode(self) -> str:
+        if self.__touch_mode:
+            return "usb_touch"
+        if self.__hybrid_mode:
+            return "usb_hybrid"
         if len(self.__mouses) == 0:
             return ""
         if self.__mouse_current.is_absolute():

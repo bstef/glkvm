@@ -42,6 +42,7 @@ from ...errors import OperationError
 
 from ... import aiotools
 from ... import aioproc
+from ... import tools
 import asyncio
 
 from ...htserver import HttpExposed
@@ -107,6 +108,7 @@ from .api.export import ExportApi
 from .api.redfish import RedfishApi
 from .api.custom_screen import CustomScreenApi
 from .api.recorder import RecorderApi
+from .api.serial import SerialApi
 
 
 # =====
@@ -173,6 +175,7 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
     __EV_AP_STATE = "ap"
     __EV_TURN_STATE = "turn"
     __EV_RECORDER_STATE = "recorder"
+    __EV_SERIAL_STATE = "serial"
 
     def __init__(  # pylint: disable=too-many-arguments,too-many-locals
         self,
@@ -208,6 +211,7 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
         self.__stream_forever = stream_forever
         self.__switch = switch
         self.__fingerbot_api = FingerbotApi()
+        self.__serial_api = SerialApi()
         self.__turn_api = TurnApi()
         self.__repeater_api = RepeaterApi()
         self.__modem_api = ModemApi()
@@ -250,6 +254,7 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
             # SwitchApi(switch),
             ExportApi(info_manager, atx, user_gpio),
             RedfishApi(info_manager, atx),
+            self.__serial_api,
         ]
         if self.__switch is not None:
             self.__apis.append(SwitchApi(self.__switch))
@@ -270,6 +275,7 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
             _Subsystem.make(self.__ap_api, "Ap", self.__EV_AP_STATE),
             _Subsystem.make(self.__turn_api, "turn", self.__EV_TURN_STATE),
             _Subsystem.make(self.__recorder_api, "Recorder", self.__EV_RECORDER_STATE),
+            _Subsystem.make(self.__serial_api, "Serial", self.__EV_SERIAL_STATE),
         ]
         if self.__switch is not None:
             self.__subsystems.append(_Subsystem.make(switch, "Switch", self.__EV_SWITCH_STATE))
@@ -277,6 +283,9 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
         self.__streamer_notifier = aiotools.AioNotifier()
         self.__reset_streamer = False
         self.__new_streamer_params: dict = {}
+        # Mode changes are deliberately kept out of streamer parameters: those
+        # parameters can be consumed while awaiting a streamer restart.
+        self.__pending_gl_webrtc: (bool | None) = None
 
         # ===== 自适应模式 (webrtc_client) 相关状态
         self.__adaptive_mode: bool = False
@@ -287,34 +296,7 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
     # ===== ADAPTIVE MODE (webrtc_client) MANAGEMENT
 
     @staticmethod
-    async def __kill_proc_graceful(proc_name: str, logger: Any) -> None:
-        """先发 SIGTERM，等待 500ms 后若进程仍存在则发 SIGKILL。
-        既给进程机会清理 PID 文件/Unix socket（避免残留导致重启失败），
-        又将缓冲区播放时长限制在 ≤500ms（优于纯 SIGTERM 的 ~1s）。
-        """
-        # --- SIGTERM：请求进程自行清理后退出 ---
-        try:
-            p = await asyncio.create_subprocess_exec(
-                "killall", "-TERM", proc_name,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            rc = await p.wait()
-            if rc != 0:
-                # rc != 0 表示进程本就不存在，无需继续等待和 SIGKILL
-                logger.debug("%s not running (killall -TERM rc=%d), skipping SIGKILL", proc_name, rc)
-                return
-            logger.info("Sent SIGTERM to %s, waiting 500ms ...", proc_name)
-        except Exception as ex:
-            # killall 本身执行失败（如二进制缺失），无法确认进程状态，跳过后续操作
-            logger.warning("Failed to send SIGTERM to %s: %s", proc_name, ex)
-            return
-
-        # 等待进程响应 SIGTERM 并自行清理；500ms 是优雅关闭的超时上限。
-        # 若进程在此期间已退出，后续 SIGKILL 会返回 rc!=0 并静默跳过，无额外代价。
-        await asyncio.sleep(0.5)
-
-        # --- SIGKILL：兜底确保进程完全退出 ---
+    async def __kill_proc(proc_name: str, logger: Any) -> None:
         try:
             p = await asyncio.create_subprocess_exec(
                 "killall", "-9", proc_name,
@@ -322,13 +304,59 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
                 stderr=asyncio.subprocess.DEVNULL,
             )
             rc = await p.wait()
-            if rc == 0:
-                logger.info("Sent SIGKILL to %s", proc_name)
-            else:
-                # 进程已在 500ms 内自行退出，SIGKILL 时已不存在——正常情况
-                logger.debug("%s already exited before SIGKILL (rc=%d)", proc_name, rc)
+            if rc != 0:
+                logger.debug("%s not running (killall -9 rc=%d)", proc_name, rc)
+                return
+            logger.info("Sent SIGKILL to %s", proc_name)
         except Exception as ex:
             logger.warning("Failed to send SIGKILL to %s: %s", proc_name, ex)
+
+    @staticmethod
+    async def __terminate_webrtc_client(proc: asyncio.subprocess.Process, logger: Any) -> None:
+        """Give webrtc_client time to exit gracefully, then force-kill it."""
+        await aioproc.kill_process(proc, 4.0, logger)
+
+    async def __terminate_orphaned_webrtc_client(self, logger: Any) -> None:
+        """Stop a client left behind after kvmd lost its in-memory state."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "killall", "-TERM", "webrtc_client",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            if await proc.wait() != 0:
+                logger.debug("webrtc_client not running")
+                return
+        except Exception as ex:
+            logger.warning("Failed to send SIGTERM to webrtc_client: %s", ex)
+            return
+
+        logger.info("Sent SIGTERM to orphaned webrtc_client; waiting 2s ...")
+        await asyncio.sleep(2.0)
+        await self.__kill_proc("webrtc_client", logger)
+
+    async def __has_adaptive_resources(self, logger: Any) -> bool:
+        """Return whether adaptive-mode resources still need cleanup."""
+        if (
+            self.__adaptive_mode
+            or (self.__webrtc_client_task and not self.__webrtc_client_task.done())
+            or (self.__webrtc_client_proc and self.__webrtc_client_proc.returncode is None)
+            or pathlib.Path("/tmp/kvmd_janus_disable").exists()
+        ):
+            return True
+
+        # kvmd may have been restarted, losing both its Process object and the
+        # in-memory adaptive flag while the old client remains alive.
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "killall", "-0", "webrtc_client",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            return (await proc.wait() == 0)
+        except Exception as ex:
+            logger.warning("Failed to check webrtc_client state: %s", ex)
+            return False
 
     async def __enter_adaptive_mode(self) -> None:
         """进入自适应模式：杀掉 janus 和 ustreamer，启动 webrtc_client 并加入看门狗"""
@@ -348,16 +376,10 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
             except Exception as ex:
                 logger.warning("Failed to write /tmp/kvmd_janus_disable: %s", ex)
 
-            # 停止 kvmd 的 ustreamer 进程
-            await self.__streamer.ensure_stop(immediately=True, force=True)
+            # Wait for ustreamer to release the capture device before starting WebRTC.
+            await self.__streamer.ensure_stop(immediately=True, force=True, graceful=True)
 
-            # 并行优雅终止 janus/ustreamer：SIGTERM → 等待 500ms → SIGKILL
-            # 并行执行使总等待时间保持 ~500ms（而非串行的 ~1s+）；
-            # SIGTERM 给进程机会删除 PID 文件和 Unix socket，防止残留影响后续重启
-            await asyncio.gather(
-                self.__kill_proc_graceful("janus", logger),
-                self.__kill_proc_graceful("ustreamer", logger),
-            )
+            await self.__kill_proc("janus", logger)
 
             # 启动 webrtc_client 看门狗任务
             if self.__webrtc_client_task and not self.__webrtc_client_task.done():
@@ -392,12 +414,13 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
             await asyncio.gather(self.__webrtc_client_task, return_exceptions=True)
         self.__webrtc_client_task = None
 
-        # 杀掉 webrtc_client 进程（如果还在运行）
-        # 超时设为 2.0s：给 webrtc_client 足够时间正常释放 IOMMU/DMA 映射，
-        # 避免 SIGKILL 强杀导致 rk_iommu page fault 错误风暴阻塞 asyncio 事件循环
         if self.__webrtc_client_proc:
-            await aioproc.kill_process(self.__webrtc_client_proc, 2.0, logger)
+            await self.__terminate_webrtc_client(self.__webrtc_client_proc, logger)
             self.__webrtc_client_proc = None
+        else:
+            # kvmd may have restarted while webrtc_client remained alive. In
+            # that case there is no Process object, but false must still stop it.
+            await self.__terminate_orphaned_webrtc_client(logger)
         logger.info("Adaptive mode deactivated")
 
         # webrtc_client 已完全退出，现在移除禁用标志，JanusRunner 立即启动 Janus
@@ -458,11 +481,8 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
                 log_file = None
                 logger.warning("webrtc_client exited (code=%d), restarting in 2s ...", exit_code)
             except asyncio.CancelledError:
-                # 看门狗被取消：先 kill 进程，再清理 pipe_task
-                # log_file 由 finally 统一关闭，此处无需重复处理
                 if self.__webrtc_client_proc:
-                    # 给 2.0s 让进程正常退出并释放 IOMMU/DMA 资源
-                    await aioproc.kill_process(self.__webrtc_client_proc, 2.0, logger)
+                    await self.__terminate_webrtc_client(self.__webrtc_client_proc, logger)
                     self.__webrtc_client_proc = None
                 if pipe_task and not pipe_task.done():
                     pipe_task.cancel()
@@ -487,10 +507,11 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
     @exposed_http("POST", "/streamer/set_params")
     async def __streamer_set_params_handler(self, req: Request) -> Response:
         current_params = self.__streamer.get_params()
-        # gl_webrtc 不是 streamer 内部参数，单独处理
+        # gl_webrtc 不是 streamer 内部参数。单独保存最近一次模式请求，
+        # 避免普通 streamer 参数处理在 await 期间把它清掉。
         gl_webrtc_raw = req.query.get("gl_webrtc")
-        if gl_webrtc_raw:
-            self.__new_streamer_params["gl_webrtc"] = valid_bool(gl_webrtc_raw)
+        if gl_webrtc_raw is not None:
+            self.__pending_gl_webrtc = valid_bool(gl_webrtc_raw)
         for (name, validator, exc_cls) in [
             ("quality",      valid_stream_quality,      StreamerQualityNotSupported),
             ("desired_fps",  valid_stream_fps,          None),
@@ -548,6 +569,23 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
                     assert sub.trigger_state
                     await sub.trigger_state()
             await self._broadcast_ws_event(self.__EV_HID_KEYMAPS_STATE, await self.__hid_api.get_keymaps())  # FIXME
+            return (await self._ws_loop(ws))
+
+    # 专供 gl-pion 经 WebRTC data channel 中继 HID 输入的轻量端点。
+    # 仅经 Unix Socket 由白名单进程访问（免 token），不下发任何状态广播，
+    # 只复用现有二进制 HID handler（事件字节 1..5）。连接建立/断开时会触发
+    # _on_ws_opened/_on_ws_closed，其中包含 __hid.clear_events()，作为防卡键兜底。
+    @exposed_http("GET", "/hid/ws", allowed_exe_paths=["/usr/bin/gl-pion"])
+    async def __hid_ws_handler(self, req: Request) -> WebSocketResponse:
+        async with self._ws_session(
+            req,
+            stream=False,
+            client_ip="gl-pion",
+            user_agent="gl-pion",
+            device_type="service",
+            browser="gl-pion",
+            auth_token="",
+        ) as ws:
             return (await self._ws_loop(ws))
 
     @exposed_ws("ping")
@@ -620,7 +658,7 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
         self.__hid.clear_events()
         self.__streamer_notifier.notify()
         # 异步发送 SIGUSR1 信号给 gl_kvm_gui 进程
-        aiotools.create_short_task(asyncio.create_subprocess_shell("killall -SIGUSR1 gl_kvm_gui"))
+        aiotools.create_short_task(tools.run_command("killall", "-SIGUSR1", "gl_kvm_gui", timeout=5))
 
     async def _on_ws_closed(self, _: WsSession) -> None:
         # 这里清理会受到rtty不会正确释放tcp连接的影响,导致会隔好几秒才进行收尾
@@ -628,7 +666,7 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
         self.__hid.clear_events()
         self.__streamer_notifier.notify()
         # 异步发送 SIGUSR1 信号给 gl_kvm_gui 进程
-        aiotools.create_short_task(asyncio.create_subprocess_shell("killall -SIGUSR1 gl_kvm_gui"))
+        aiotools.create_short_task(tools.run_command("killall", "-SIGUSR1", "gl_kvm_gui", timeout=5))
 
     def __has_stream_clients(self) -> bool:
         return bool(sum(map(
@@ -649,9 +687,11 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
 
             # 优先处理参数变化：确保在启动/重启 streamer 之前参数已经更新
             # 这样可以避免"先以旧参数启动、再重启为新参数"的双启动问题
-            if self.__new_streamer_params or self.__reset_streamer:
-                # 提取并移除 gl_webrtc（非 streamer 内部参数），用于控制自适应模式切换
-                new_gl_webrtc = self.__new_streamer_params.pop("gl_webrtc", None)
+            if self.__pending_gl_webrtc is not None or self.__new_streamer_params or self.__reset_streamer:
+                # 读取并清除当前模式请求。新的请求若在任意 await 期间到达，
+                # 会保留到下一轮循环处理，不会被 streamer 参数清空。
+                new_gl_webrtc = self.__pending_gl_webrtc
+                self.__pending_gl_webrtc = None
                 if new_gl_webrtc is True and not self.__adaptive_mode:
                     # gl_webrtc=True：进入自适应模式，杀掉 janus+ustreamer，启动 webrtc_client
                     self.__streamer.set_params(self.__new_streamer_params)
@@ -661,12 +701,16 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
                     await self.__enter_adaptive_mode()
                     await self.__streamer_notifier.wait()
                     continue
-                elif new_gl_webrtc is False and self.__adaptive_mode:
-                    # gl_webrtc=False：退出自适应模式，恢复正常流
-                    await self.__exit_adaptive_mode()
-                    prev_internal = False  # 重置，以便退出 adaptive_mode 后重新计算
-                    # 强制走完整重启路径（streamer 已被 exit_adaptive_mode 停止）
-                    self.__reset_streamer = True
+                elif new_gl_webrtc is False:
+                    # Avoid restarting the normal streamer when there is
+                    # nothing to clean up, but recover stale clients left by a
+                    # kvmd restart.
+                    if await self.__has_adaptive_resources(get_logger(0)):
+                        await self.__exit_adaptive_mode()
+                        prev_internal = False  # 重置，以便退出 adaptive_mode 后重新计算
+                        # 强制走完整重启路径（streamer 已被 exit_adaptive_mode 停止）
+                        self.__reset_streamer = True
+
                 elif self.__adaptive_mode:
                     # 处于自适应模式时，忽略其他参数变更（not gl_webrtc），不重启 ustreamer
                     # 但仍保存参数更新，以便退出自适应模式后生效
@@ -724,7 +768,32 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
                     await self.__streamer.set_internal_stream_required(False, stop_immediately=False)
                 prev_internal = internal_need
 
-            if self.__reset_streamer or self.__new_streamer_params:
+            if self.__pending_gl_webrtc is not None or self.__reset_streamer or self.__new_streamer_params:
+                # 补检在本轮 await 期间收到的最新模式请求。
+                new_gl_webrtc = self.__pending_gl_webrtc
+                self.__pending_gl_webrtc = None
+                if new_gl_webrtc is True and not self.__adaptive_mode:
+                    self.__streamer.set_params(self.__new_streamer_params)
+                    self.__new_streamer_params = {}
+                    self.__reset_streamer = False
+                    prev_internal = False
+                    await self.__enter_adaptive_mode()
+                    await self.__streamer_notifier.wait()
+                    continue
+                if new_gl_webrtc is False:
+                    if await self.__has_adaptive_resources(get_logger(0)):
+                        await self.__exit_adaptive_mode()
+                        prev_internal = False
+                        self.__reset_streamer = True
+
+                elif self.__adaptive_mode:
+                    if self.__new_streamer_params:
+                        self.__streamer.set_params(self.__new_streamer_params)
+                        self.__new_streamer_params = {}
+                    self.__reset_streamer = False
+                    await self.__streamer_notifier.wait()
+                    continue
+
                 # 检查是否包含h264_bitrate参数变化
                 has_bitrate_change = "h264_bitrate" in self.__new_streamer_params
                 only_bitrate_change = (

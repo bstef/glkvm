@@ -22,6 +22,7 @@
 
 import asyncio
 import os
+import shlex
 import signal
 import time
 
@@ -39,6 +40,7 @@ from ....htserver import exposed_http
 from ....htserver import make_json_response
 
 from ....plugins.msd import BaseMsd
+from ....plugins.msd import MsdOfflineError
 
 from ..streamer import Streamer
 
@@ -96,6 +98,8 @@ class RecorderApi:
 
     async def __do_start(self) -> None:
         storage_root = self.__msd.get_storage_root()
+        if not storage_root:
+            raise MsdOfflineError()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_file = os.path.join(storage_root, f"rec_{timestamp}.mp4")
 
@@ -112,7 +116,7 @@ class RecorderApi:
             f"-fflags +genpts+igndts "
             f"-avoid_negative_ts make_zero "
             f"-shortest "
-            f"-y {output_file}"
+            f"-y {shlex.quote(output_file)}"
         )
 
         try:

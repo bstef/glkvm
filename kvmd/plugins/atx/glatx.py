@@ -36,12 +36,12 @@ class Plugin(BaseAtx):
                 }
                 
             # 使用run_async将subprocess.run放入线程池中执行，避免阻塞事件循环
-            cmd = f"{self.__atxpower_bin} {self.__device} power_state"
-            
+            cmd = [self.__atxpower_bin, self.__device, "power_state"]
+
             try:
                 # 直接传递同步函数到run_async
                 def run_command():
-                    return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=3)
+                    return subprocess.run(cmd, capture_output=True, text=True, timeout=3)
                 
                 result = await aiotools.run_async(run_command)
                 
@@ -92,14 +92,14 @@ class Plugin(BaseAtx):
                 if current_device_exists != prev_device_exists or current_device_exists:
                     state = await self.get_state()
                     if self.__need_update or state != prev_state:
-                        get_logger(0).info(f"ATX状态变化: {state}")
+                        get_logger(0).info(f"ATX state changed: {state}")
                         yield state
                         prev_state = state
                         self.__need_update = False
                 
                 prev_device_exists = current_device_exists
             except Exception as e:
-                get_logger(0).error(f"监测ATX设备状态时出错: {e}")
+                get_logger(0).error(f"Error monitoring ATX device state: {e}")
                 
             await asyncio.sleep(1)  # 每秒检查一次
 
@@ -146,19 +146,19 @@ class Plugin(BaseAtx):
 
     @aiotools.atomic_fg
     async def __inner_run_cmd(self, action: str) -> None:
-        cmd = f"{self.__atxpower_bin} {self.__device} {action}"
+        cmd = [self.__atxpower_bin, self.__device, action]
         try:
             # 使用run_async将subprocess.run放入线程池中执行，避免阻塞事件循环
             def run_command():
-                return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
-            
+                return subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+
             try:
                 result = await aiotools.run_async(run_command)
-                
+
                 if result.returncode != 0:
                     error = result.stderr.strip() if result.stderr else "Unknown error"
                     get_logger(0).error(f"stdout: {result.stdout}")
-                    raise AtxError(f"Failed to execute {cmd}: {error}")
+                    raise AtxError(f"Failed to execute {' '.join(cmd)}: {error}")
                     
                 get_logger(0).info("Executed ATX command %r", action)
                 

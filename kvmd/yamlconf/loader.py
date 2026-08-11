@@ -21,6 +21,7 @@
 
 
 import os
+import sys
 
 from .. import tools
 
@@ -72,11 +73,17 @@ class _YamlLoader(yaml.SafeLoader):
                 for child in sorted(os.listdir(inc_path)):
                     child_path = os.path.join(inc_path, child)
                     if os.path.isfile(child_path) or os.path.islink(child_path):
-                        yaml_merge(tree, (load_yaml_file(child_path) or {}), child_path)
+                        self.__safe_merge(tree, child_path)
             elif os.path.isfile(inc_path) or os.path.islink(inc_path):
-                yaml_merge(tree, (load_yaml_file(inc_path) or {}), inc_path)
+                self.__safe_merge(tree, inc_path)
             # Missing file is silently skipped (optional includes)
         return tree
+
+    def __safe_merge(self, tree: dict, path: str) -> None:
+        try:
+            yaml_merge(tree, (load_yaml_file(path) or {}), path)
+        except Exception as ex:
+            print(f"WARNING: Skipping config file {path!r} due to parse error: {tools.efmt(ex)}", file=sys.stderr)
 
 
 _YamlLoader.add_constructor("!include", _YamlLoader.include)
